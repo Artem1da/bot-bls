@@ -537,13 +537,19 @@ def main():
     logger.info("Check interval: %ds, Headless: %s", CHECK_INTERVAL, HEADLESS)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=HEADLESS,
-            args=[
+        # Use system chromium if playwright's bundled one is missing
+        chromium_path = os.path.expanduser("~/.cache/ms-playwright/chromium-1194/chrome-linux/chrome")
+        launch_kwargs = {
+            "headless": HEADLESS,
+            "args": [
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
             ],
-        )
+        }
+        if os.path.exists(chromium_path):
+            launch_kwargs["executable_path"] = chromium_path
+            logger.info("Using chromium at %s", chromium_path)
+        browser = p.chromium.launch(**launch_kwargs)
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
