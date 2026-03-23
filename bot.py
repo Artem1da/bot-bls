@@ -271,6 +271,53 @@ def solve_bls_number_captcha(page: Page) -> bool:
     return True
 
 
+def _find_password_field(page: Page) -> "ElementHandle | None":
+    """Find the password input on the BLS captcha/password page.
+
+    Tries type=password first, then looks for a visible text input
+    near the 'Password' label.
+    """
+    # Standard password field
+    pf = page.query_selector("input[type='password']")
+    if pf:
+        return pf
+
+    # BLS may label it "Password *" but use type=text with obfuscated id.
+    # Find by proximity to the Password label.
+    try:
+        pf = page.evaluate_handle("""() => {
+            // Find a label or text node containing "Password"
+            const allText = document.querySelectorAll('label, span, p, div');
+            for (const el of allText) {
+                const txt = el.textContent.trim();
+                if (/^Password\\s*\\*?$/.test(txt)) {
+                    // Look for an input right after this element
+                    let sibling = el.nextElementSibling;
+                    for (let i = 0; i < 5 && sibling; i++) {
+                        const inp = sibling.tagName === 'INPUT' ? sibling
+                                  : sibling.querySelector('input');
+                        if (inp && inp.type !== 'hidden') return inp;
+                        sibling = sibling.nextElementSibling;
+                    }
+                    // Also check parent's next sibling
+                    let parent = el.parentElement;
+                    if (parent) {
+                        const inp = parent.querySelector('input:not([type=hidden])');
+                        if (inp) return inp;
+                    }
+                }
+            }
+            return null;
+        }""").as_element()
+        if pf:
+            return pf
+    except Exception:
+        pass
+
+    # Last resort: any visible text input (but not the ones in captcha)
+    return _find_visible_text_input(page)
+
+
 def do_login(page: Page) -> bool:
     """Log in to BLS account.
 
@@ -285,8 +332,7 @@ def do_login(page: Page) -> bool:
     take_screenshot(page, "login_page")
 
     # Detect which step we're on
-    content = page.content().lower()
-    on_password_step = "enter your account password" in content or "password" in content.split("email")[0] if "email" not in content else False
+    on_password_step = _has_number_grid_captcha(page) or "enter your account password" in page.content().lower()
 
     # ── Step 1: Email ──
     if not on_password_step:
@@ -303,20 +349,28 @@ def do_login(page: Page) -> bool:
         logger.info("Filled email: %s", BLS_EMAIL)
         time.sleep(1)
 
-        # Click "Verify" button
+        # Click "Verify" — this triggers navigation to the password+captcha page.
+        # We use expect_navigation to avoid implicit waits hanging on networkidle.
         verify_btn = page.query_selector(
             "button:has-text('Verify'), input[value='Verify'], "
             "button[type='submit'], input[type='submit']"
         )
-        if verify_btn:
-            verify_btn.click()
-            logger.info("Clicked Verify button")
-        else:
+        if not verify_btn:
             logger.error("Cannot find Verify button")
             take_screenshot(page, "login_no_verify_btn")
             return False
 
-        time.sleep(5)
+        try:
+            with page.expect_navigation(wait_until="domcontentloaded", timeout=30000):
+                verify_btn.click()
+                logger.info("Clicked Verify, waiting for navigation...")
+        except PWTimeout:
+            logger.warning("Navigation after Verify timed out, continuing anyway")
+        except Exception as e:
+            logger.warning("Navigation after Verify: %s, continuing", e)
+
+        # Wait for the page to settle (captcha images may still load)
+        time.sleep(3)
         take_screenshot(page, "after_verify")
 
         # Check for rate-limit after verify
@@ -325,14 +379,24 @@ def do_login(page: Page) -> bool:
             return False
 
     # ── Step 2: Password + Number CAPTCHA ──
-    logger.info("Login step 2: entering password...")
-    password_field = page.query_selector("input[type='password']")
-    if not password_field:
-        # BLS may use type=text for password too
-        password_field = _find_visible_text_input(page)
+    logger.info("Login step 2: password + captcha...")
 
+    # Solve BLS number-grid CAPTCHA first (it's above the password field)
+    if _has_number_grid_captcha(page):
+        logger.info("Number-grid CAPTCHA detected on password page")
+        if not solve_bls_number_captcha(page):
+            logger.error("Failed to solve number-grid CAPTCHA")
+            return False
+    elif page.query_selector(".h-captcha, iframe[src*='hcaptcha']"):
+        logger.info("hCaptcha on login page, solving...")
+        if not solve_and_submit_captcha(page):
+            logger.error("Failed to solve login hCaptcha")
+            return False
+
+    # Fill password
+    password_field = _find_password_field(page)
     if not password_field:
-        logger.error("Cannot find password input after verify")
+        logger.error("Cannot find password input")
         take_screenshot(page, "login_no_password_field")
         return False
 
@@ -341,38 +405,38 @@ def do_login(page: Page) -> bool:
     password_field.fill(BLS_PASSWORD)
     logger.info("Filled password")
     time.sleep(1)
+    take_screenshot(page, "password_filled")
 
-    # Solve BLS number-grid CAPTCHA if present
-    if _has_number_grid_captcha(page):
-        logger.info("Number-grid CAPTCHA detected on password page")
-        if not solve_bls_number_captcha(page):
-            logger.error("Failed to solve number-grid CAPTCHA")
-            return False
-
-    # Solve hCaptcha if present instead
-    if page.query_selector(".h-captcha, iframe[src*='hcaptcha']"):
-        logger.info("hCaptcha on login page, solving...")
-        if not solve_and_submit_captcha(page):
-            logger.error("Failed to solve login hCaptcha")
-            return False
-
-    # Click Submit button
+    # Click Submit — this also triggers navigation
+    submit_clicked = False
     for sel in [
         "button:has-text('Submit')", "input[value='Submit']",
         "button[type='submit']", "input[type='submit']",
-        "button:has-text('Login')", "button:has-text('Sign In')",
-        "input[value='Login']", "#btnSubmit", "#btnLogin",
+        "button:has-text('Login')", "input[value='Login']",
+        "#btnSubmit", "#btnLogin",
     ]:
         try:
             el = page.query_selector(sel)
             if el and el.is_visible():
-                el.click()
-                logger.info("Clicked login/submit button: %s", sel)
+                try:
+                    with page.expect_navigation(wait_until="domcontentloaded", timeout=30000):
+                        el.click()
+                        logger.info("Clicked Submit: %s", sel)
+                except PWTimeout:
+                    logger.warning("Navigation after Submit timed out, continuing")
+                except Exception as e:
+                    logger.warning("Navigation after Submit: %s, continuing", e)
+                submit_clicked = True
                 break
         except Exception:
             continue
 
-    time.sleep(5)
+    if not submit_clicked:
+        logger.error("Could not find Submit button on login page")
+        take_screenshot(page, "login_no_submit")
+        return False
+
+    time.sleep(3)
     take_screenshot(page, "after_login")
 
     # Check for rate-limit
@@ -602,16 +666,27 @@ def try_book_date(page: Page, target_date: str) -> bool:
 
 
 def is_rate_limited(page: Page) -> bool:
-    """Check if the page shows a rate-limit / Too Many Requests error."""
-    content = page.content().lower()
-    indicators = [
-        "too many requests",
-        "rate limit",
-        "excessive requests",
-        "try again after some time",
-        "429",
-    ]
-    return any(ind in content for ind in indicators)
+    """Check if the page shows a rate-limit / Too Many Requests error.
+
+    We check visible text only (not raw HTML) to avoid false positives
+    from random numbers in image URLs, captcha data, etc.
+    """
+    try:
+        # Check page title
+        title = (page.title() or "").lower()
+        if "too many requests" in title or "429" in title:
+            return True
+
+        # Check visible body text (not raw HTML source)
+        body_text = page.inner_text("body").lower()
+        indicators = [
+            "too many requests",
+            "rate limit",
+            "excessive requests from your ip",
+        ]
+        return any(ind in body_text for ind in indicators)
+    except Exception:
+        return False
 
 
 def wait_with_jitter(seconds: float):
