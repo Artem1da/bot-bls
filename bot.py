@@ -173,22 +173,26 @@ def _has_number_grid_captcha(page: Page) -> bool:
 
 
 def _find_captcha_grid(page: Page) -> dict:
-    """Find the captcha grid area and target number atomically.
+    """Find the captcha grid area and instruction element position.
 
     Instead of trying to find individual cell <img> elements (BLS layers
     multiple images per cell for obfuscation), we find the visual grid
     container and divide it into a 3×3 grid mathematically.
 
+    NOTE: BLS uses a custom font that renders different digits visually
+    than what the DOM text contains, so we cannot trust textContent for
+    the target number. The caller must OCR the instruction line visually.
+
     Returns dict with:
-      - targetNumber: the number to find
+      - instrBox: {x, y, w, h} bounding box of the instruction text
       - gridBox: {x, y, w, h} bounding box of the 3×3 grid area
       - cellBoxes: list of 9 {x, y, w, h} boxes (row-major order)
       - debug: debug info string
     """
     info = page.evaluate("""() => {
-        const result = { targetNumber: '', gridBox: null, cellBoxes: [], debug: '' };
+        const result = { instrBox: null, gridBox: null, cellBoxes: [], debug: '' };
 
-        // Step 1: Find the instruction element and extract target number
+        // Step 1: Find the instruction element
         let instructionEl = null;
         const allEls = document.querySelectorAll('*');
         for (const el of allEls) {
@@ -205,12 +209,14 @@ def _find_captcha_grid(page: Page) -> dict:
             return result;
         }
 
-        const instrText = instructionEl.textContent.trim();
-        const numMatch = instrText.match(/number\s+(\d+)/i);
-        if (numMatch) {
-            result.targetNumber = numMatch[1];
-        }
-        result.debug = 'Instruction: "' + instrText.substring(0, 80) + '"';
+        // Get instruction bounding box for visual OCR
+        const instrRect = instructionEl.getBoundingClientRect();
+        result.instrBox = {
+            x: instrRect.x, y: instrRect.y,
+            w: instrRect.width, h: instrRect.height
+        };
+        result.debug = 'Instruction element found: ' +
+            Math.round(instrRect.width) + 'x' + Math.round(instrRect.height);
 
         // Step 2: Walk up from instruction to find a container with images
         let container = instructionEl.parentElement;
@@ -229,9 +235,7 @@ def _find_captcha_grid(page: Page) -> dict:
         result.debug += ' | Container: ' + container.tagName +
             ' | imgs: ' + imgs.length;
 
-        // Step 3: Find the grid bounding box.
-        // Get all images with reasonable size, then find the bounding box of
-        // the cluster that forms the 3×3 grid.
+        // Step 3: Find the grid bounding box from images below instruction
         const imgRects = imgs.map(img => {
             const r = img.getBoundingClientRect();
             return { x: r.x, y: r.y, w: r.width, h: r.height, area: r.width * r.height };
@@ -242,11 +246,7 @@ def _find_captcha_grid(page: Page) -> dict:
             return result;
         }
 
-        // The grid images cluster together — find bounding box of ALL sized images.
-        // This gives us the overall grid area.
-        const instrRect = instructionEl.getBoundingClientRect();
-
-        // Filter images that are BELOW the instruction text (grid is below instruction)
+        // Filter images that are BELOW the instruction text
         const belowInstr = imgRects.filter(r => r.y >= instrRect.bottom - 5);
         const targetImgs = belowInstr.length >= 9 ? belowInstr : imgRects;
 
@@ -279,9 +279,8 @@ def _find_captcha_grid(page: Page) -> dict:
         return result;
     }""")
 
-    logger.info("Captcha grid detection: target=%s, cells=%d | %s",
-                info.get('targetNumber', ''), len(info.get('cellBoxes', [])),
-                info.get('debug', ''))
+    logger.info("Captcha grid detection: cells=%d | %s",
+                len(info.get('cellBoxes', [])), info.get('debug', ''))
     return info
 
 
@@ -291,16 +290,20 @@ def solve_bls_number_captcha(page: Page) -> bool:
     The CAPTCHA shows: "Please select all boxes with number XXX"
     with a 3×3 grid of number images.
 
-    Strategy: find the grid container, divide into 3×3 regions, screenshot
-    each region, OCR via rucaptcha, compare with target, click matches.
+    BLS uses a custom font that renders different digits than the DOM text,
+    so we must OCR the instruction line visually (not read from DOM).
+
+    Strategy: screenshot the instruction line + each of the 9 grid cells,
+    OCR all 10 images via rucaptcha, use the instruction OCR as target,
+    compare with cell OCR results, click matches.
     """
-    # Find grid and extract target number atomically (same JS evaluate)
+    # Find grid layout
     captcha_info = _find_captcha_grid(page)
-    target_number = captcha_info.get('targetNumber', '')
+    instr_box = captcha_info.get('instrBox')
     cell_boxes = captcha_info.get('cellBoxes', [])
 
-    if not target_number:
-        logger.error("Cannot extract target number from captcha instruction")
+    if not instr_box:
+        logger.error("Cannot find captcha instruction element")
         take_screenshot(page, "captcha_no_instruction")
         return False
 
@@ -309,11 +312,20 @@ def solve_bls_number_captcha(page: Page) -> bool:
         take_screenshot(page, "captcha_no_cells")
         return False
 
-    logger.info("BLS number CAPTCHA: target=%s, %d cells detected", target_number, len(cell_boxes))
-
-    # Screenshot each cell individually
     os.makedirs("screenshots", exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Screenshot the instruction line for visual OCR
+    instr_png = page.screenshot(clip={
+        "x": instr_box['x'],
+        "y": instr_box['y'],
+        "width": instr_box['w'],
+        "height": instr_box['h'],
+    })
+    with open(f"screenshots/captcha_instr_{ts}.png", "wb") as f:
+        f.write(instr_png)
+
+    # Screenshot each cell
     cell_images_b64 = []
     for i, box in enumerate(cell_boxes):
         # Inset by 10% to avoid grid borders / gaps between cells
@@ -328,23 +340,37 @@ def solve_bls_number_captcha(page: Page) -> bool:
         cell_png = page.screenshot(clip=clip)
         cell_b64 = base64.b64encode(cell_png).decode("ascii")
         cell_images_b64.append(cell_b64)
-
-        # Save for debugging
         with open(f"screenshots/captcha_cell_{ts}_{i+1}.png", "wb") as f:
             f.write(cell_png)
 
-    logger.info("Captured %d cell screenshots", len(cell_images_b64))
+    logger.info("Captured instruction + %d cell screenshots", len(cell_images_b64))
 
-    # OCR all 9 cells in parallel via rucaptcha
-    ocr_results = ocr_cells_batch(RUCAPTCHA_KEY, cell_images_b64)
+    # OCR instruction + all 9 cells in parallel via rucaptcha
+    instr_b64 = base64.b64encode(instr_png).decode("ascii")
+    all_images = [instr_b64] + cell_images_b64
+    ocr_results = ocr_cells_batch(RUCAPTCHA_KEY, all_images, text_indices={0})
     if not ocr_results:
         logger.error("OCR batch failed")
         return False
 
+    # First result is the instruction line OCR — extract the target number
+    instr_ocr = ocr_results[0] or ""
+    cell_ocr = ocr_results[1:]  # remaining 9 are cell results
+
+    # Extract target number from instruction OCR (e.g. "Please select all boxes with number 125")
+    instr_digits = re.findall(r'\d+', instr_ocr)
+    if not instr_digits:
+        logger.error("Could not extract target number from instruction OCR: '%s'", instr_ocr)
+        take_screenshot(page, "captcha_instr_ocr_fail")
+        return False
+
+    # Take the last number found (the target is at the end of the sentence)
+    target_number = instr_digits[-1]
+    logger.info("Visual OCR instruction: '%s' -> target number: %s", instr_ocr, target_number)
+
     # Find cells whose OCR text matches the target number
     cells_to_click = []
-    for i, ocr_text in enumerate(ocr_results):
-        # Clean OCR result: strip whitespace, keep only digits
+    for i, ocr_text in enumerate(cell_ocr):
         if ocr_text:
             cleaned = re.sub(r'\D', '', ocr_text)
         else:
@@ -356,7 +382,7 @@ def solve_bls_number_captcha(page: Page) -> bool:
 
     if not cells_to_click:
         logger.error("No cells matched target number %s. OCR results: %s",
-                     target_number, ocr_results)
+                     target_number, cell_ocr)
         take_screenshot(page, "captcha_no_match")
         return False
 

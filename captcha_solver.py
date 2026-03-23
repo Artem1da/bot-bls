@@ -115,17 +115,20 @@ def solve_grid_captcha(api_key: str, image_base64: str, instruction: str,
     return cells
 
 
-def _submit_ocr(api_key: str, image_base64: str) -> str | None:
+def _submit_ocr(api_key: str, image_base64: str,
+                numeric_only: bool = True) -> str | None:
     """Submit a single image for OCR text recognition and return request_id."""
-    resp = requests.post(RUCAPTCHA_IN, data={
+    payload = {
         "key": api_key,
         "method": "base64",
         "body": image_base64,
-        "numeric": 1,       # only digits
-        "min_len": 2,
-        "max_len": 4,
         "json": 1,
-    }, timeout=30)
+    }
+    if numeric_only:
+        payload["numeric"] = 1
+        payload["min_len"] = 2
+        payload["max_len"] = 4
+    resp = requests.post(RUCAPTCHA_IN, data=payload, timeout=30)
     data = resp.json()
     if data.get("status") != 1:
         logger.error("rucaptcha OCR submit error: %s", data)
@@ -134,20 +137,28 @@ def _submit_ocr(api_key: str, image_base64: str) -> str | None:
 
 
 def ocr_cells_batch(api_key: str, cell_images_b64: list[str],
-                    max_attempts: int = 30) -> list[str | None]:
+                    max_attempts: int = 30,
+                    text_indices: set[int] | None = None) -> list[str | None]:
     """OCR multiple cell images in parallel via rucaptcha.
 
     Submits all images at once, then polls for all results.
     Returns list of OCR texts (or None for failed cells), same order as input.
+
+    text_indices: set of indices that contain mixed text+digits (not numeric-only).
+                  These are submitted without numeric constraint.
     """
+    if text_indices is None:
+        text_indices = set()
+
     # Submit all cells in parallel
     request_ids = []
 
-    def submit_one(img_b64):
-        return _submit_ocr(api_key, img_b64)
+    def submit_one(idx_img):
+        idx, img_b64 = idx_img
+        return _submit_ocr(api_key, img_b64, numeric_only=(idx not in text_indices))
 
-    with ThreadPoolExecutor(max_workers=9) as pool:
-        futures = {pool.submit(submit_one, img): idx
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = {pool.submit(submit_one, (idx, img)): idx
                    for idx, img in enumerate(cell_images_b64)}
         id_by_idx = {}
         for future in as_completed(futures):
