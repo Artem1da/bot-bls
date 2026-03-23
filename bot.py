@@ -501,29 +501,25 @@ def do_login(page: Page) -> bool:
         take_screenshot(page, "login_no_password_field")
         return False
 
-    # BLS marks the password field with "entry-disabled" class and may set
-    # disabled/readonly attributes.  Remove those so we can type into it.
+    # BLS marks the password field with "entry-disabled" class and overlays
+    # hide it, so Playwright's click/fill won't work.  Use JS to set value.
     try:
-        page.evaluate("""(el) => {
+        page.evaluate("""([el, pwd]) => {
             el.removeAttribute('disabled');
             el.removeAttribute('readonly');
             el.classList.remove('entry-disabled');
-        }""", password_field)
-    except Exception as e:
-        logger.warning("Could not remove disabled attrs from password field: %s", e)
-
-    try:
-        password_field.click()
-        time.sleep(0.3)
-        password_field.fill(BLS_PASSWORD)
-    except Exception as e:
-        logger.warning("Standard fill failed (%s), using JS to set value", e)
-        page.evaluate("""(el, pwd) => {
+            el.style.display = '';
+            el.style.visibility = 'visible';
+            el.focus();
             el.value = pwd;
             el.dispatchEvent(new Event('input', {bubbles: true}));
             el.dispatchEvent(new Event('change', {bubbles: true}));
-        }""", password_field, BLS_PASSWORD)
-    logger.info("Filled password")
+        }""", [password_field, BLS_PASSWORD])
+    except Exception as e:
+        logger.error("Failed to fill password via JS: %s", e)
+        take_screenshot(page, "login_password_fill_error")
+        return False
+    logger.info("Filled password via JS")
     time.sleep(0.5)
 
     # Solve CAPTCHA
