@@ -501,9 +501,28 @@ def do_login(page: Page) -> bool:
         take_screenshot(page, "login_no_password_field")
         return False
 
-    password_field.click()
-    time.sleep(0.3)
-    password_field.fill(BLS_PASSWORD)
+    # BLS marks the password field with "entry-disabled" class and may set
+    # disabled/readonly attributes.  Remove those so we can type into it.
+    try:
+        page.evaluate("""(el) => {
+            el.removeAttribute('disabled');
+            el.removeAttribute('readonly');
+            el.classList.remove('entry-disabled');
+        }""", password_field)
+    except Exception as e:
+        logger.warning("Could not remove disabled attrs from password field: %s", e)
+
+    try:
+        password_field.click()
+        time.sleep(0.3)
+        password_field.fill(BLS_PASSWORD)
+    except Exception as e:
+        logger.warning("Standard fill failed (%s), using JS to set value", e)
+        page.evaluate("""(el, pwd) => {
+            el.value = pwd;
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+        }""", password_field, BLS_PASSWORD)
     logger.info("Filled password")
     time.sleep(0.5)
 
