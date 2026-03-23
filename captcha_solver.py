@@ -170,8 +170,8 @@ def ocr_cells_batch(api_key: str, cell_images_b64: list[str],
     submitted = sum(1 for r in request_ids if r)
     logger.info("Submitted %d/%d cell images for OCR", submitted, len(cell_images_b64))
 
-    # Wait for initial processing
-    time.sleep(10)
+    # Wait for initial processing (OCR is faster than hCaptcha)
+    time.sleep(5)
 
     # Poll all results
     results: list[str | None] = [None] * len(request_ids)
@@ -204,7 +204,7 @@ def ocr_cells_batch(api_key: str, cell_images_b64: list[str],
 
         pending = still_pending
         if pending:
-            time.sleep(5)
+            time.sleep(3)
 
     logger.info("OCR results: %s", results)
     return results
