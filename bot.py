@@ -360,10 +360,6 @@ def solve_bls_number_captcha(page: Page) -> bool:
     for i, cleaned in enumerate(cleaned_cells):
         if cleaned == target_number:
             cells_to_click.append(i)
-        logger.info("Cell %d OCR: '%s' -> cleaned: '%s' (target: %s)",
-                    i + 1, ocr_text, cleaned, target_number)
-        if cleaned == target_number:
-            cells_to_click.append(i)
 
     if not cells_to_click:
         logger.error("No cells matched target number %s. OCR results: %s",
