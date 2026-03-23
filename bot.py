@@ -983,12 +983,55 @@ def is_rate_limited(page: Page) -> bool:
         return False
 
 
+class BotRestart(Exception):
+    """Raised when /restart command is received during wait."""
+    pass
+
+
+class BotStop(Exception):
+    """Raised when /stop command is received during wait."""
+    pass
+
+
+def _handle_telegram_cmd(cmd: str):
+    """Handle a Telegram command received during wait. May raise."""
+    if cmd in ("/stop", "/pause"):
+        notify("Bot stopped by /stop command. Send /start to resume.")
+        logger.info("Bot paused by Telegram /stop command (during wait)")
+        while True:
+            time.sleep(5)
+            resume = check_telegram_commands(TG_TOKEN, TG_CHAT)
+            if resume in ("/start", "/resume", "/restart"):
+                notify("Bot resumed!")
+                logger.info("Bot resumed by Telegram %s command", resume)
+                raise BotRestart()
+    elif cmd == "/restart":
+        notify("Bot restarting iteration...")
+        logger.info("Bot restarting by Telegram /restart command (during wait)")
+        raise BotRestart()
+    elif cmd == "/status":
+        notify("Bot running. Currently waiting between iterations.")
+
+
 def wait_with_jitter(seconds: float):
-    """Sleep for `seconds` with ±JITTER_RANGE random jitter."""
+    """Sleep for `seconds` with ±JITTER_RANGE random jitter.
+
+    Checks Telegram commands every 5 seconds during the wait.
+    May raise BotRestart or BotStop.
+    """
     jitter = seconds * random.uniform(-JITTER_RANGE, JITTER_RANGE)
     actual = max(1, seconds + jitter)
     logger.info("Waiting %.0f seconds (base %d ± jitter)", actual, seconds)
-    time.sleep(actual)
+
+    elapsed = 0.0
+    poll_interval = 5
+    while elapsed < actual:
+        chunk = min(poll_interval, actual - elapsed)
+        time.sleep(chunk)
+        elapsed += chunk
+        cmd = check_telegram_commands(TG_TOKEN, TG_CHAT)
+        if cmd:
+            _handle_telegram_cmd(cmd)
 
 
 def take_screenshot(page: Page, name: str):
@@ -1045,26 +1088,14 @@ def monitor_loop(page: Page, browser: Browser):
         # ── Check for Telegram commands ──
         cmd = check_telegram_commands(TG_TOKEN, TG_CHAT)
         if cmd:
-            if cmd in ("/stop", "/pause"):
-                notify("Bot stopped by /stop command. Send /start to resume.")
-                logger.info("Bot paused by Telegram /stop command")
-                while True:
-                    time.sleep(5)
-                    resume_cmd = check_telegram_commands(TG_TOKEN, TG_CHAT)
-                    if resume_cmd in ("/start", "/resume", "/restart"):
-                        notify("Bot resumed!")
-                        logger.info("Bot resumed by Telegram %s command", resume_cmd)
-                        logged_in = False
-                        break
-                continue
-            elif cmd == "/restart":
-                notify("Bot restarting iteration...")
-                logger.info("Bot restarting by Telegram /restart command")
-                logged_in = False
-                continue
-            elif cmd == "/status":
+            if cmd == "/status":
                 notify(f"Bot running. Iteration {iteration}. "
                        f"Logged in: {logged_in}. Backoff: {backoff}s.")
+                continue
+            try:
+                _handle_telegram_cmd(cmd)
+            except BotRestart:
+                logged_in = False
                 continue
 
         # If we were rate-limited, wait BEFORE making any request
@@ -1230,6 +1261,10 @@ def monitor_loop(page: Page, browser: Browser):
 
             notify("Slots found but booking didn't confirm. Check screenshots!")
 
+        except BotRestart:
+            logger.info("Restarting iteration due to Telegram command")
+            logged_in = False
+            continue
         except PWTimeout:
             logger.error("Page load timeout")
             try:
@@ -1245,7 +1280,11 @@ def monitor_loop(page: Page, browser: Browser):
                 pass
             logged_in = False
 
-        wait_with_jitter(CHECK_INTERVAL)
+        try:
+            wait_with_jitter(CHECK_INTERVAL)
+        except BotRestart:
+            logged_in = False
+            continue
 
 
 def main():
