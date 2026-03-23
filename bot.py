@@ -494,58 +494,57 @@ def do_login(page: Page) -> bool:
     # ── Step 2: Password + Number CAPTCHA ──
     logger.info("Login step 2: password + captcha...")
 
-    # Fill password by clicking near the "Password" label and typing.
-    # BLS hides the actual <input> behind overlays, so we locate the label
-    # text, click ~30px below it (where the input visually sits), and type.
+    # Fill password by finding input[type='password'], scrolling to it,
+    # clicking its center coordinates, and typing via keyboard.
+    # BLS hides the input behind overlays so Playwright's .click()/.fill()
+    # don't work, but mouse.click at exact coordinates does.
     try:
-        pwd_label_box = page.evaluate("""() => {
-            const labels = document.querySelectorAll('label, span, p, div');
-            for (const el of labels) {
-                if (/^Password\\s*\\*?$/.test(el.textContent.trim())) {
-                    const r = el.getBoundingClientRect();
-                    if (r.width > 0 && r.height > 0) {
-                        return {x: r.x + r.width / 2, y: r.bottom + 15};
-                    }
-                }
+        pwd_coords = page.evaluate("""() => {
+            const inp = document.querySelector("input[type='password']");
+            if (!inp) return null;
+            inp.scrollIntoView({block: 'center'});
+            // Small delay for scroll to settle is handled by caller
+            const r = inp.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) {
+                return {x: r.x + r.width / 2, y: r.y + r.height / 2,
+                        w: r.width, h: r.height};
             }
             return null;
         }""")
     except Exception as e:
-        logger.error("Failed to locate Password label: %s", e)
-        pwd_label_box = None
+        logger.error("Failed to locate password input: %s", e)
+        pwd_coords = None
 
-    if pwd_label_box:
-        x, y = pwd_label_box["x"], pwd_label_box["y"]
-        logger.info("Clicking near Password label at (%d, %d)", x, y)
+    if pwd_coords:
+        time.sleep(0.3)  # let scrollIntoView settle
+        # Re-read coordinates after scroll
+        try:
+            pwd_coords = page.evaluate("""() => {
+                const inp = document.querySelector("input[type='password']");
+                if (!inp) return null;
+                const r = inp.getBoundingClientRect();
+                return {x: r.x + r.width / 2, y: r.y + r.height / 2,
+                        w: r.width, h: r.height};
+            }""")
+        except Exception:
+            pass
+        x, y = pwd_coords["x"], pwd_coords["y"]
+        logger.info("Password input at (%d, %d) size %dx%d, clicking...",
+                     x, y, pwd_coords["w"], pwd_coords["h"])
         page.mouse.click(x, y)
-        time.sleep(0.5)
+        time.sleep(0.3)
+        # Verify focus landed on the password field
+        focused_tag = page.evaluate("() => document.activeElement?.tagName")
+        focused_type = page.evaluate("() => document.activeElement?.type")
+        logger.info("Active element after click: %s type=%s", focused_tag, focused_type)
         page.keyboard.type(BLS_PASSWORD, delay=50)
         logger.info("Typed password via keyboard")
+        take_screenshot(page, "after_password_type")
     else:
-        # Fallback: try to find the input and set value via JS
-        logger.warning("Password label not found, falling back to JS value set")
-        password_field = _find_password_field(page)
-        if not password_field:
-            logger.error("Cannot find password input at all")
-            take_screenshot(page, "login_no_password_field")
-            return False
-        try:
-            page.evaluate("""([el, pwd]) => {
-                el.removeAttribute('disabled');
-                el.removeAttribute('readonly');
-                el.classList.remove('entry-disabled');
-                const nativeSetter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, 'value'
-                ).set;
-                nativeSetter.call(el, pwd);
-                el.dispatchEvent(new Event('input', {bubbles: true}));
-                el.dispatchEvent(new Event('change', {bubbles: true}));
-            }""", [password_field, BLS_PASSWORD])
-            logger.info("Set password via JS fallback")
-        except Exception as e:
-            logger.error("JS password fallback also failed: %s", e)
-            take_screenshot(page, "login_password_fill_error")
-            return False
+        logger.error("Cannot find password input[type='password']")
+        take_screenshot(page, "login_no_password_field")
+        return False
+    time.sleep(0.5)
     time.sleep(0.5)
 
     # Solve CAPTCHA
