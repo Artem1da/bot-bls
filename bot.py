@@ -654,81 +654,168 @@ def click_book_appointment(page: Page) -> bool:
     return False
 
 
+def _find_visible_kendo_dropdown(page: Page, label_text: str) -> "str | None":
+    """Find the visible Kendo dropdown for a given label text.
+
+    BLS uses multiple duplicate form sections (honeypot anti-bot).
+    Each label+dropdown pair is duplicated ~5 times, only one is visible.
+    The dropdowns are Kendo UI (kendoDropDownList) with the actual <input>
+    having display:none and data-role='dropdownlist'.
+
+    Returns the input element's ID if found, else None.
+    """
+    try:
+        input_id = page.evaluate("""(labelText) => {
+            // Find all labels matching the text
+            const labels = document.querySelectorAll('label.form-label');
+            for (const label of labels) {
+                // Check label text (e.g. "Category*", "Location*")
+                const text = label.textContent.replace(/[\\s*]/g, '');
+                const target = labelText.replace(/[\\s*]/g, '');
+                if (text !== target) continue;
+
+                // Check if this label's parent div is visible
+                const parentDiv = label.closest('div.mb-3');
+                if (!parentDiv) continue;
+                const pstyle = window.getComputedStyle(parentDiv);
+                if (pstyle.display === 'none' || pstyle.visibility === 'hidden'
+                    || pstyle.opacity === '0') continue;
+                const r = parentDiv.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) continue;
+
+                // Found visible label — get the associated input
+                const forId = label.getAttribute('for');
+                if (forId) {
+                    const inp = document.getElementById(forId);
+                    if (inp && inp.getAttribute('data-role') === 'dropdownlist') {
+                        return forId;
+                    }
+                }
+            }
+            return null;
+        }""", label_text)
+        return input_id
+    except Exception as e:
+        logger.warning("Error finding Kendo dropdown for '%s': %s", label_text, e)
+        return None
+
+
+def _select_kendo_dropdown(page: Page, input_id: str, value_name: str, label: str) -> bool:
+    """Select a value in a Kendo dropdown by its display text.
+
+    Uses the Kendo API: $(selector).data('kendoDropDownList').select(fn).
+    """
+    try:
+        result = page.evaluate("""([inputId, valueName]) => {
+            const widget = $("#" + inputId).data("kendoDropDownList");
+            if (!widget) return {ok: false, error: "No Kendo widget for #" + inputId};
+            // Find item by Name text
+            const ds = widget.dataSource.data();
+            let idx = -1;
+            for (let i = 0; i < ds.length; i++) {
+                if (ds[i].Name === valueName) {
+                    idx = i + 1;  // +1 because index 0 is the optionLabel "--Select--"
+                    break;
+                }
+            }
+            if (idx === -1) {
+                const names = ds.map(d => d.Name);
+                return {ok: false, error: "Value '" + valueName + "' not in " + JSON.stringify(names)};
+            }
+            widget.select(idx);
+            widget.trigger("change");
+            return {ok: true, selected: widget.text()};
+        }""", [input_id, value_name])
+        if result.get("ok"):
+            logger.info("Selected '%s' in %s (#%s)", result.get("selected"), label, input_id)
+            return True
+        else:
+            logger.warning("Kendo select failed for %s: %s", label, result.get("error"))
+            return False
+    except Exception as e:
+        logger.warning("Error selecting '%s' in %s (#%s): %s", value_name, label, input_id, e)
+        return False
+
+
 def fill_form(page: Page) -> bool:
-    """Fill in the visa type selection form.
+    """Fill in the visa type selection form (Kendo UI dropdowns).
+
+    BLS uses Kendo UI dropdownlists, not standard <select>.
+    Each field is duplicated ~5 times as anti-bot honeypots.
+    We find the visible one and use the Kendo API to select values.
 
     Returns True if at least one dropdown was found and filled.
     """
-    # The BLS form has dropdowns that load sequentially.
-    # We try common selector patterns used by BLS sites.
     filled_count = 0
 
-    # Log all <select> elements on page for debugging
-    all_selects = page.query_selector_all("select")
-    logger.info("Found %d <select> elements on page", len(all_selects))
-    for i, s in enumerate(all_selects):
-        try:
-            sid = s.get_attribute("id") or ""
-            sname = s.get_attribute("name") or ""
-            opts = s.query_selector_all("option")
-            opt_texts = [o.text_content().strip() for o in opts[:5]]
-            logger.info("  select[%d] id=%s name=%s options=%s", i, sid, sname, opt_texts)
-        except Exception:
-            pass
+    # Log form structure for debugging
+    kendo_count = page.evaluate("""() => {
+        return document.querySelectorAll('input[data-role="dropdownlist"]').length;
+    }""")
+    logger.info("Found %d Kendo dropdown inputs on page", kendo_count)
 
-    # Each dropdown: list of (selectors, value, label)
-    dropdowns = [
-        (["#AppointmentCategoryId", "#category", "select[name='AppointmentCategoryId']"],
-         CATEGORY, "Category"),
-        (["#LocationId", "#centre", "#location", "select[name='LocationId']"],
-         LOCATION, "Location"),
-        (["#VisaTypeId", "#visa_type", "select[name='VisaTypeId']"],
-         VISA_TYPE, "Visa Type"),
-    ]
+    # ── Category ──
+    cat_id = _find_visible_kendo_dropdown(page, "Category*")
+    if cat_id:
+        if _select_kendo_dropdown(page, cat_id, CATEGORY, "Category"):
+            filled_count += 1
+        time.sleep(1)
+    else:
+        logger.warning("Could not find visible Category dropdown")
 
-    for selectors, value, label in dropdowns:
-        found = False
-        for sel in selectors:
-            try:
-                el = page.query_selector(sel)
-                if el:
-                    select_dropdown(page, sel, value)
-                    filled_count += 1
-                    found = True
-                    break
-            except Exception as e:
-                logger.warning("Failed to select '%s' in %s: %s", value, sel, e)
-                continue
-        if not found:
-            logger.warning("Could not find dropdown for %s", label)
+    # ── Appointment For (radio buttons, not dropdown) ──
+    try:
+        page.evaluate("""(value) => {
+            const radios = document.querySelectorAll('input[type="radio"]');
+            for (const r of radios) {
+                if (r.value !== value) continue;
+                // Check if this radio is visible
+                const parent = r.closest('div.mb-3') || r.closest('div.d-flex');
+                if (!parent) continue;
+                const style = window.getComputedStyle(r);
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                const rect = r.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) continue;
+                r.checked = true;
+                r.click();
+                return true;
+            }
+            return false;
+        }""", APPOINTMENT_FOR)
+        logger.info("Selected Appointment For: %s", APPOINTMENT_FOR)
+        filled_count += 1
+        time.sleep(1)
+    except Exception as e:
+        logger.warning("Failed to set Appointment For: %s", e)
 
-    time.sleep(2)
+    # ── Location ──
+    loc_id = _find_visible_kendo_dropdown(page, "Location*")
+    if loc_id:
+        if _select_kendo_dropdown(page, loc_id, LOCATION, "Location"):
+            filled_count += 1
+        time.sleep(2)  # dependent dropdowns need time to load
+    else:
+        logger.warning("Could not find visible Location dropdown")
 
-    # These depend on previous selections loading
-    dependent_dropdowns = [
-        (["#VisaSubTypeId", "#visa_sub_type", "select[name='VisaSubTypeId']"],
-         VISA_SUB_TYPE, "Visa Sub Type"),
-        (["#AppointmentForId", "#appointment_for", "select[name='AppointmentForId']"],
-         APPOINTMENT_FOR, "Appointment For"),
-    ]
+    # ── Visa Type ──
+    vt_id = _find_visible_kendo_dropdown(page, "Visa Type*")
+    if vt_id:
+        if _select_kendo_dropdown(page, vt_id, VISA_TYPE, "Visa Type"):
+            filled_count += 1
+        time.sleep(2)
+    else:
+        logger.warning("Could not find visible Visa Type dropdown")
 
-    for selectors, value, label in dependent_dropdowns:
-        found = False
-        for sel in selectors:
-            try:
-                el = page.query_selector(sel)
-                if el:
-                    select_dropdown(page, sel, value)
-                    filled_count += 1
-                    found = True
-                    break
-            except Exception as e:
-                logger.warning("Failed to select '%s' in %s: %s", value, sel, e)
-                continue
-        if not found:
-            logger.warning("Could not find dropdown for %s", label)
+    # ── Visa Sub Type ──
+    vst_id = _find_visible_kendo_dropdown(page, "Visa Sub Type*")
+    if vst_id:
+        if _select_kendo_dropdown(page, vst_id, VISA_SUB_TYPE, "Visa Sub Type"):
+            filled_count += 1
+        time.sleep(1)
+    else:
+        logger.warning("Could not find visible Visa Sub Type dropdown")
 
-    logger.info("Filled %d/%d dropdowns", filled_count, len(dropdowns) + len(dependent_dropdowns))
+    logger.info("Filled %d/5 form fields", filled_count)
     return filled_count > 0
 
 
