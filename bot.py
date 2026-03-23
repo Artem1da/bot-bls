@@ -172,12 +172,104 @@ def _has_number_grid_captcha(page: Page) -> bool:
     return "please select all boxes with number" in content
 
 
+def _find_captcha_container(page: Page):
+    """Find the captcha grid container using JS DOM inspection.
+
+    Returns (container_element, cell_elements) or (None, []).
+    """
+    # Use JS to find the actual structure — dump what we see for debugging
+    info = page.evaluate("""() => {
+        const result = { html: '', cellCount: 0, cellTag: '', strategy: '' };
+
+        // Strategy 1: find all images on page — captcha cells are typically
+        // small square images in a grid
+        const allImgs = Array.from(document.querySelectorAll('img'));
+        const smallImgs = allImgs.filter(img => {
+            const r = img.getBoundingClientRect();
+            return r.width > 50 && r.width < 300 && r.height > 50 && r.height < 300;
+        });
+
+        // Strategy 2: find all canvas elements (captcha may render on canvas)
+        const canvases = Array.from(document.querySelectorAll('canvas'));
+        const smallCanvases = canvases.filter(c => {
+            const r = c.getBoundingClientRect();
+            return r.width > 50 && r.width < 300 && r.height > 50 && r.height < 300;
+        });
+
+        // Strategy 3: find divs with onclick or click handlers that look like grid cells
+        const clickableDivs = Array.from(document.querySelectorAll('div[onclick], div[data-id], div.cell, div.captcha-cell, div.box'));
+        const squareDivs = clickableDivs.filter(d => {
+            const r = d.getBoundingClientRect();
+            return r.width > 50 && r.width < 300 && r.height > 50 && r.height < 300;
+        });
+
+        // Determine which strategy found ~9 elements
+        let cells = [];
+        if (smallImgs.length >= 9) {
+            cells = smallImgs.slice(0, 9);
+            result.strategy = 'img';
+            result.cellTag = cells[0].tagName;
+        } else if (smallCanvases.length >= 9) {
+            cells = smallCanvases.slice(0, 9);
+            result.strategy = 'canvas';
+            result.cellTag = 'CANVAS';
+        } else if (squareDivs.length >= 9) {
+            cells = squareDivs.slice(0, 9);
+            result.strategy = 'div';
+            result.cellTag = 'DIV';
+        }
+
+        result.cellCount = cells.length;
+
+        // Get bounding boxes of cells for coordinate-based clicking
+        result.cellBoxes = cells.map(c => {
+            const r = c.getBoundingClientRect();
+            return { x: r.x, y: r.y, w: r.width, h: r.height };
+        });
+
+        // For debugging: dump first few levels of the captcha area
+        const instructionEl = document.querySelector('p, div, span');
+        const allEls = document.querySelectorAll('*');
+        let captchaParent = null;
+        for (const el of allEls) {
+            if (el.textContent && /select all boxes with number/i.test(el.textContent) &&
+                el.children.length < 50) {
+                captchaParent = el;
+                break;
+            }
+        }
+        if (captchaParent) {
+            result.html = captchaParent.outerHTML.substring(0, 3000);
+        }
+
+        // Also count all images and canvases for debugging
+        result.totalImgs = allImgs.length;
+        result.totalCanvases = canvases.length;
+        result.smallImgs = smallImgs.length;
+        result.smallCanvases = smallCanvases.length;
+        result.clickableDivs = squareDivs.length;
+
+        return result;
+    }""")
+
+    logger.info("Captcha DOM analysis: strategy=%s, cells=%d, imgs=%d (small:%d), "
+                "canvases=%d (small:%d), clickableDivs=%d",
+                info.get('strategy', 'none'), info.get('cellCount', 0),
+                info.get('totalImgs', 0), info.get('smallImgs', 0),
+                info.get('totalCanvases', 0), info.get('smallCanvases', 0),
+                info.get('clickableDivs', 0))
+    if info.get('html'):
+        logger.info("Captcha HTML (first 1000 chars): %s", info['html'][:1000])
+
+    return info
+
+
 def solve_bls_number_captcha(page: Page) -> bool:
     """Solve the BLS number-grid CAPTCHA.
 
     The CAPTCHA shows: "Please select all boxes with number XXX"
-    with a 3×3 grid of number images.  We screenshot the grid,
-    send it to rucaptcha, and click the matching cells.
+    with a 3×3 grid of number images.  We screenshot the grid area,
+    send it to rucaptcha, and click the matching cells by coordinates.
     """
     # Extract the target number from instruction text
     content = page.content()
@@ -191,80 +283,64 @@ def solve_bls_number_captcha(page: Page) -> bool:
     instruction = f"Select all boxes with number {target_number}"
     logger.info("BLS number CAPTCHA: target = %s", target_number)
 
-    # Find the captcha grid container.
-    # The grid cells are typically <div> or <img> elements inside a container.
-    # We look for common patterns: a container with multiple clickable image cells.
-    grid_container = page.query_selector(
-        "div.captcha-grid, div.captcha-container, "
-        "div:has(> div > img[src*='captcha']), "
-        "div:has(> div > img[src*='Captcha']), "
-        "div:has(> div > img[src*='blob'])"
-    )
-    if not grid_container:
-        # Fallback: find the element that contains the instruction and the grid
-        # Try to find a parent container by looking for the instruction text element
-        instruction_el = page.query_selector(
-            "p:has-text('select all boxes'), "
-            "div:has-text('select all boxes'), "
-            "span:has-text('select all boxes')"
-        )
-        if instruction_el:
-            # The grid is likely a sibling or nearby element
-            grid_container = instruction_el.evaluate_handle(
-                """el => {
-                    // Walk up to find a container that has multiple child divs/images
-                    let parent = el.parentElement;
-                    for (let i = 0; i < 5 && parent; i++) {
-                        const imgs = parent.querySelectorAll('img');
-                        if (imgs.length >= 9) return parent;
-                        parent = parent.parentElement;
-                    }
-                    return null;
-                }"""
-            ).as_element()
+    # Analyze the captcha DOM structure
+    captcha_info = _find_captcha_container(page)
+    cell_boxes = captcha_info.get('cellBoxes', [])
+    strategy = captcha_info.get('strategy', 'none')
 
-    if not grid_container:
-        logger.error("Cannot find captcha grid container")
-        take_screenshot(page, "captcha_no_grid")
+    if len(cell_boxes) < 9:
+        logger.error("Could not find 9 captcha cells (found %d via '%s')",
+                     len(cell_boxes), strategy)
+        take_screenshot(page, "captcha_no_cells")
         return False
 
-    # Screenshot the grid for rucaptcha
-    grid_screenshot = grid_container.screenshot()
+    logger.info("Found %d captcha cells via '%s' strategy", len(cell_boxes), strategy)
+
+    # Screenshot just the grid area (bounding box of all 9 cells)
+    min_x = min(b['x'] for b in cell_boxes)
+    min_y = min(b['y'] for b in cell_boxes)
+    max_x = max(b['x'] + b['w'] for b in cell_boxes)
+    max_y = max(b['y'] + b['h'] for b in cell_boxes)
+
+    # Add some padding
+    clip = {
+        "x": max(0, min_x - 5),
+        "y": max(0, min_y - 5),
+        "width": (max_x - min_x) + 10,
+        "height": (max_y - min_y) + 10,
+    }
+
+    grid_screenshot = page.screenshot(clip=clip)
     image_b64 = base64.b64encode(grid_screenshot).decode("ascii")
-    logger.info("Captured captcha grid screenshot (%d bytes)", len(grid_screenshot))
+    logger.info("Captured captcha grid screenshot: %dx%d, %d bytes",
+                int(clip['width']), int(clip['height']), len(grid_screenshot))
+
+    # Save grid screenshot for debugging
+    os.makedirs("screenshots", exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    with open(f"screenshots/captcha_grid_{ts}.png", "wb") as f:
+        f.write(grid_screenshot)
 
     # Send to rucaptcha
-    cells = solve_grid_captcha(RUCAPTCHA_KEY, image_b64, instruction, rows=3, cols=3)
-    if not cells:
+    cells_to_click = solve_grid_captcha(RUCAPTCHA_KEY, image_b64, instruction, rows=3, cols=3)
+    if not cells_to_click:
         logger.error("rucaptcha failed to solve grid captcha")
         return False
 
-    # Find all clickable grid cells (images or divs)
-    # They should be inside the container, in order (row-major)
-    cell_elements = grid_container.query_selector_all("img")
-    if len(cell_elements) < 9:
-        # Try divs with background images
-        cell_elements = grid_container.query_selector_all("div[style*='background'], div > img")
-    if len(cell_elements) < 9:
-        # Broader: any direct children that look clickable
-        cell_elements = grid_container.query_selector_all("div > div")
+    logger.info("rucaptcha says click cells: %s", cells_to_click)
 
-    logger.info("Found %d captcha cell elements", len(cell_elements))
-
-    if len(cell_elements) < 9:
-        logger.error("Expected 9 captcha cells, found %d", len(cell_elements))
-        take_screenshot(page, "captcha_wrong_cell_count")
-        return False
-
-    # Click the cells indicated by rucaptcha (1-indexed)
-    for cell_num in cells:
+    # Click cells by their center coordinates (much more reliable than element selectors)
+    for cell_num in cells_to_click:
         idx = cell_num - 1  # convert to 0-indexed
-        if 0 <= idx < len(cell_elements):
-            cell_elements[idx].click()
-            logger.info("Clicked captcha cell %d", cell_num)
-            time.sleep(0.3)
+        if 0 <= idx < len(cell_boxes):
+            box = cell_boxes[idx]
+            center_x = box['x'] + box['w'] / 2
+            center_y = box['y'] + box['h'] / 2
+            page.mouse.click(center_x, center_y)
+            logger.info("Clicked captcha cell %d at (%.0f, %.0f)", cell_num, center_x, center_y)
+            time.sleep(0.5)
         else:
-            logger.warning("Cell number %d out of range", cell_num)
+            logger.warning("Cell number %d out of range (have %d cells)", cell_num, len(cell_boxes))
 
     time.sleep(1)
     take_screenshot(page, "captcha_cells_clicked")
