@@ -25,7 +25,9 @@ from datetime import datetime, date
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, Page, Browser, TimeoutError as PWTimeout
 
-from captcha_solver import solve_hcaptcha
+import base64
+
+from captcha_solver import solve_hcaptcha, solve_grid_captcha
 from notifier import send_telegram
 
 load_dotenv()
@@ -160,7 +162,113 @@ def _is_login_page(page: Page) -> bool:
         "login" in url
         or "session is expired" in content
         or "please log in" in content
+        or "enter your account password" in content
     )
+
+
+def _has_number_grid_captcha(page: Page) -> bool:
+    """Check if the BLS number-grid CAPTCHA is present on page."""
+    content = page.content().lower()
+    return "please select all boxes with number" in content
+
+
+def solve_bls_number_captcha(page: Page) -> bool:
+    """Solve the BLS number-grid CAPTCHA.
+
+    The CAPTCHA shows: "Please select all boxes with number XXX"
+    with a 3×3 grid of number images.  We screenshot the grid,
+    send it to rucaptcha, and click the matching cells.
+    """
+    # Extract the target number from instruction text
+    content = page.content()
+    m = re.search(r"[Pp]lease select all boxes with number\s+(\d+)", content)
+    if not m:
+        logger.error("Cannot extract target number from captcha instruction")
+        take_screenshot(page, "captcha_no_instruction")
+        return False
+
+    target_number = m.group(1)
+    instruction = f"Select all boxes with number {target_number}"
+    logger.info("BLS number CAPTCHA: target = %s", target_number)
+
+    # Find the captcha grid container.
+    # The grid cells are typically <div> or <img> elements inside a container.
+    # We look for common patterns: a container with multiple clickable image cells.
+    grid_container = page.query_selector(
+        "div.captcha-grid, div.captcha-container, "
+        "div:has(> div > img[src*='captcha']), "
+        "div:has(> div > img[src*='Captcha']), "
+        "div:has(> div > img[src*='blob'])"
+    )
+    if not grid_container:
+        # Fallback: find the element that contains the instruction and the grid
+        # Try to find a parent container by looking for the instruction text element
+        instruction_el = page.query_selector(
+            "p:has-text('select all boxes'), "
+            "div:has-text('select all boxes'), "
+            "span:has-text('select all boxes')"
+        )
+        if instruction_el:
+            # The grid is likely a sibling or nearby element
+            grid_container = instruction_el.evaluate_handle(
+                """el => {
+                    // Walk up to find a container that has multiple child divs/images
+                    let parent = el.parentElement;
+                    for (let i = 0; i < 5 && parent; i++) {
+                        const imgs = parent.querySelectorAll('img');
+                        if (imgs.length >= 9) return parent;
+                        parent = parent.parentElement;
+                    }
+                    return null;
+                }"""
+            ).as_element()
+
+    if not grid_container:
+        logger.error("Cannot find captcha grid container")
+        take_screenshot(page, "captcha_no_grid")
+        return False
+
+    # Screenshot the grid for rucaptcha
+    grid_screenshot = grid_container.screenshot()
+    image_b64 = base64.b64encode(grid_screenshot).decode("ascii")
+    logger.info("Captured captcha grid screenshot (%d bytes)", len(grid_screenshot))
+
+    # Send to rucaptcha
+    cells = solve_grid_captcha(RUCAPTCHA_KEY, image_b64, instruction, rows=3, cols=3)
+    if not cells:
+        logger.error("rucaptcha failed to solve grid captcha")
+        return False
+
+    # Find all clickable grid cells (images or divs)
+    # They should be inside the container, in order (row-major)
+    cell_elements = grid_container.query_selector_all("img")
+    if len(cell_elements) < 9:
+        # Try divs with background images
+        cell_elements = grid_container.query_selector_all("div[style*='background'], div > img")
+    if len(cell_elements) < 9:
+        # Broader: any direct children that look clickable
+        cell_elements = grid_container.query_selector_all("div > div")
+
+    logger.info("Found %d captcha cell elements", len(cell_elements))
+
+    if len(cell_elements) < 9:
+        logger.error("Expected 9 captcha cells, found %d", len(cell_elements))
+        take_screenshot(page, "captcha_wrong_cell_count")
+        return False
+
+    # Click the cells indicated by rucaptcha (1-indexed)
+    for cell_num in cells:
+        idx = cell_num - 1  # convert to 0-indexed
+        if 0 <= idx < len(cell_elements):
+            cell_elements[idx].click()
+            logger.info("Clicked captcha cell %d", cell_num)
+            time.sleep(0.3)
+        else:
+            logger.warning("Cell number %d out of range", cell_num)
+
+    time.sleep(1)
+    take_screenshot(page, "captcha_cells_clicked")
+    return True
 
 
 def do_login(page: Page) -> bool:
@@ -168,10 +276,7 @@ def do_login(page: Page) -> bool:
 
     BLS uses a two-step login:
       Step 1 — Enter email, click "Verify"
-      Step 2 — Enter password, click "Submit" / "Login"
-
-    All input fields are type=text with randomised ids, so we locate
-    them positionally (first visible text input on the page).
+      Step 2 — Enter password + solve number-grid CAPTCHA, click "Submit"
     """
     if not _is_login_page(page):
         logger.info("Not on login page, assuming already logged in")
@@ -179,49 +284,47 @@ def do_login(page: Page) -> bool:
 
     take_screenshot(page, "login_page")
 
+    # Detect which step we're on
+    content = page.content().lower()
+    on_password_step = "enter your account password" in content or "password" in content.split("email")[0] if "email" not in content else False
+
     # ── Step 1: Email ──
-    logger.info("Login step 1: entering email...")
-    email_field = _find_visible_text_input(page)
-    if not email_field:
-        logger.error("Cannot find email input on login page")
-        take_screenshot(page, "login_no_email_field")
-        return False
-
-    email_field.click()
-    time.sleep(0.3)
-    email_field.fill(BLS_EMAIL)
-    logger.info("Filled email: %s", BLS_EMAIL)
-    time.sleep(1)
-
-    # Solve CAPTCHA if present on email step
-    if page.query_selector(".h-captcha, iframe[src*='hcaptcha']"):
-        logger.info("CAPTCHA on login page (email step), solving...")
-        if not solve_and_submit_captcha(page):
-            logger.error("Failed to solve login CAPTCHA (email step)")
+    if not on_password_step:
+        logger.info("Login step 1: entering email...")
+        email_field = _find_visible_text_input(page)
+        if not email_field:
+            logger.error("Cannot find email input on login page")
+            take_screenshot(page, "login_no_email_field")
             return False
 
-    # Click "Verify" button
-    verify_btn = page.query_selector(
-        "button:has-text('Verify'), input[value='Verify'], "
-        "button[type='submit'], input[type='submit']"
-    )
-    if verify_btn:
-        verify_btn.click()
-        logger.info("Clicked Verify button")
-    else:
-        logger.error("Cannot find Verify button")
-        take_screenshot(page, "login_no_verify_btn")
-        return False
+        email_field.click()
+        time.sleep(0.3)
+        email_field.fill(BLS_EMAIL)
+        logger.info("Filled email: %s", BLS_EMAIL)
+        time.sleep(1)
 
-    time.sleep(5)
-    take_screenshot(page, "after_verify")
+        # Click "Verify" button
+        verify_btn = page.query_selector(
+            "button:has-text('Verify'), input[value='Verify'], "
+            "button[type='submit'], input[type='submit']"
+        )
+        if verify_btn:
+            verify_btn.click()
+            logger.info("Clicked Verify button")
+        else:
+            logger.error("Cannot find Verify button")
+            take_screenshot(page, "login_no_verify_btn")
+            return False
 
-    # Check for rate-limit after verify
-    if is_rate_limited(page):
-        logger.warning("Rate-limited after email verify step")
-        return False
+        time.sleep(5)
+        take_screenshot(page, "after_verify")
 
-    # ── Step 2: Password ──
+        # Check for rate-limit after verify
+        if is_rate_limited(page):
+            logger.warning("Rate-limited after email verify step")
+            return False
+
+    # ── Step 2: Password + Number CAPTCHA ──
     logger.info("Login step 2: entering password...")
     password_field = page.query_selector("input[type='password']")
     if not password_field:
@@ -239,19 +342,26 @@ def do_login(page: Page) -> bool:
     logger.info("Filled password")
     time.sleep(1)
 
-    # Solve CAPTCHA if present on password step
-    if page.query_selector(".h-captcha, iframe[src*='hcaptcha']"):
-        logger.info("CAPTCHA on login page (password step), solving...")
-        if not solve_and_submit_captcha(page):
-            logger.error("Failed to solve login CAPTCHA (password step)")
+    # Solve BLS number-grid CAPTCHA if present
+    if _has_number_grid_captcha(page):
+        logger.info("Number-grid CAPTCHA detected on password page")
+        if not solve_bls_number_captcha(page):
+            logger.error("Failed to solve number-grid CAPTCHA")
             return False
 
-    # Click submit / login button
+    # Solve hCaptcha if present instead
+    if page.query_selector(".h-captcha, iframe[src*='hcaptcha']"):
+        logger.info("hCaptcha on login page, solving...")
+        if not solve_and_submit_captcha(page):
+            logger.error("Failed to solve login hCaptcha")
+            return False
+
+    # Click Submit button
     for sel in [
+        "button:has-text('Submit')", "input[value='Submit']",
         "button[type='submit']", "input[type='submit']",
         "button:has-text('Login')", "button:has-text('Sign In')",
-        "button:has-text('Submit')", "input[value='Login']",
-        "input[value='Submit']", "#btnSubmit", "#btnLogin",
+        "input[value='Login']", "#btnSubmit", "#btnLogin",
     ]:
         try:
             el = page.query_selector(sel)
@@ -265,6 +375,11 @@ def do_login(page: Page) -> bool:
     time.sleep(5)
     take_screenshot(page, "after_login")
 
+    # Check for rate-limit
+    if is_rate_limited(page):
+        logger.warning("Rate-limited after login submit")
+        return False
+
     # Verify we left the login page
     if _is_login_page(page):
         logger.error("Still on login page after submit — login likely failed")
@@ -273,6 +388,32 @@ def do_login(page: Page) -> bool:
 
     logger.info("Login successful")
     return True
+
+
+def click_book_appointment(page: Page) -> bool:
+    """Click the 'Book New Appointment' / 'Book your appointment' link/button."""
+    for sel in [
+        "a:has-text('Book New Appointment')",
+        "a:has-text('Book your appointment')",
+        "a:has-text('Book Appointment')",
+        "a[href*='newappointment']",
+        "a[href*='NewAppointment']",
+        "a[href*='appointment']",
+        "button:has-text('Book')",
+    ]:
+        try:
+            el = page.query_selector(sel)
+            if el and el.is_visible():
+                el.click()
+                logger.info("Clicked 'Book Appointment': %s", sel)
+                time.sleep(3)
+                return True
+        except Exception:
+            continue
+
+    logger.warning("Could not find 'Book Appointment' button/link")
+    take_screenshot(page, "no_book_appointment")
+    return False
 
 
 def fill_form(page: Page):
@@ -563,41 +704,60 @@ def monitor_loop(page: Page, browser: Browser):
                         logger.error("Login failed, retrying next iteration")
                         wait_with_jitter(CHECK_INTERVAL)
                         continue
-                    # After login, navigate back to appointment page
-                    time.sleep(5)  # extra delay before second navigation
-                    page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
-                    time.sleep(3)
-                    if is_rate_limited(page):
-                        backoff = RATE_LIMIT_COOLDOWN
-                        logger.warning("Rate-limited after login! Will wait %d s", backoff)
-                        logged_in = False
-                        continue
                 else:
                     logged_in = True  # No credentials = no login needed
+
+            # After login we land on a dashboard — click "Book New Appointment"
+            if not click_book_appointment(page):
+                # Maybe we're already on the form page, try to continue
+                logger.info("Proceeding without Book Appointment click")
+
+            time.sleep(3)
+            if is_rate_limited(page):
+                backoff = RATE_LIMIT_COOLDOWN
+                logger.warning("Rate-limited after navigating! Will wait %d s", backoff)
+                logged_in = False
+                continue
+
+            take_screenshot(page, "appointment_page")
 
             # Dump page selectors for debugging (first time after login)
             if iteration <= 2:
                 dump_form_structure(page)
 
-            # Fill the form
+            # Fill the visa type form
             fill_form(page)
             time.sleep(2)
 
             take_screenshot(page, "form_filled")
 
-            # Solve CAPTCHA and submit
-            if page.query_selector(".h-captcha, iframe[src*='hcaptcha']"):
-                logger.info("CAPTCHA detected, solving...")
-                if not solve_and_submit_captcha(page):
-                    logger.error("CAPTCHA solve failed, retrying next iteration")
-                    wait_with_jitter(CHECK_INTERVAL)
-                    continue
-
             # Click submit/book to proceed
             click_submit(page)
-            time.sleep(5)
+            time.sleep(3)
 
             take_screenshot(page, "after_submit")
+
+            # Solve CAPTCHA after submit (BLS shows number-grid or hCaptcha here)
+            if _has_number_grid_captcha(page):
+                logger.info("Number-grid CAPTCHA after submit, solving...")
+                if not solve_bls_number_captcha(page):
+                    logger.error("Post-submit CAPTCHA solve failed, retrying")
+                    wait_with_jitter(CHECK_INTERVAL)
+                    continue
+                # Click submit again after solving captcha
+                click_submit(page)
+                time.sleep(5)
+                take_screenshot(page, "after_captcha_submit")
+
+            if page.query_selector(".h-captcha, iframe[src*='hcaptcha']"):
+                logger.info("hCaptcha after submit, solving...")
+                if not solve_and_submit_captcha(page):
+                    logger.error("Post-submit hCaptcha solve failed, retrying")
+                    wait_with_jitter(CHECK_INTERVAL)
+                    continue
+                click_submit(page)
+                time.sleep(5)
+                take_screenshot(page, "after_hcaptcha_submit")
 
             # Check for available dates
             available, full_cap = extract_dates(page)
