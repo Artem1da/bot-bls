@@ -526,9 +526,16 @@ def monitor_loop(page: Page, browser: Browser):
     logged_in = False
     backoff = 0  # current rate-limit backoff in seconds
 
+    RATE_LIMIT_COOLDOWN = 120  # minimum 2 minutes on rate-limit
+
     while True:
         iteration += 1
         logger.info("── Iteration %d ──", iteration)
+
+        # If we were rate-limited, wait BEFORE making any request
+        if backoff > 0:
+            logger.info("Rate-limit cooldown: sleeping %d s before next request", backoff)
+            wait_with_jitter(backoff)
 
         try:
             # Navigate to the appointment page
@@ -537,11 +544,10 @@ def monitor_loop(page: Page, browser: Browser):
 
             # ── Rate-limit detection ──
             if is_rate_limited(page):
-                backoff = min(max(backoff * 2, 60), MAX_BACKOFF)
-                logger.warning("Rate-limited by BLS! Backing off for %d s", backoff)
-                notify(f"[Iter {iteration}] Rate-limited. Waiting {backoff}s before retry.")
+                backoff = min(max(backoff * 2, RATE_LIMIT_COOLDOWN), MAX_BACKOFF)
+                logger.warning("Rate-limited by BLS! Will wait %d s before next attempt", backoff)
+                notify(f"[Iter {iteration}] Rate-limited. Cooling down {backoff}s.")
                 take_screenshot(page, "rate_limited")
-                wait_with_jitter(backoff)
                 continue
             # Reset backoff on success
             backoff = 0
@@ -562,9 +568,8 @@ def monitor_loop(page: Page, browser: Browser):
                     page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
                     time.sleep(3)
                     if is_rate_limited(page):
-                        backoff = 60
-                        logger.warning("Rate-limited after login! Backing off %d s", backoff)
-                        wait_with_jitter(backoff)
+                        backoff = RATE_LIMIT_COOLDOWN
+                        logger.warning("Rate-limited after login! Will wait %d s", backoff)
                         logged_in = False
                         continue
                 else:
