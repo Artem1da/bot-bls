@@ -494,44 +494,58 @@ def do_login(page: Page) -> bool:
     # ── Step 2: Password + Number CAPTCHA ──
     logger.info("Login step 2: password + captcha...")
 
-    # Fill password FIRST (before captcha, so it's ready when we click Submit)
-    password_field = _find_password_field(page)
-    if not password_field:
-        logger.error("Cannot find password input")
-        take_screenshot(page, "login_no_password_field")
-        return False
-
-    # BLS hides the password field behind overlays (z-index:10000) and marks
-    # it with "entry-disabled" class.  Remove overlays, enable the field,
-    # then set value via JS since Playwright can't click invisible elements.
+    # Fill password by clicking near the "Password" label and typing.
+    # BLS hides the actual <input> behind overlays, so we locate the label
+    # text, click ~30px below it (where the input visually sits), and type.
     try:
-        page.evaluate("""([el, pwd]) => {
-            // Remove any overlays covering the password field
-            document.querySelectorAll('[class*="overlay"]').forEach(o => {
-                if (o.style.zIndex && parseInt(o.style.zIndex) > 999) {
-                    o.style.display = 'none';
+        pwd_label_box = page.evaluate("""() => {
+            const labels = document.querySelectorAll('label, span, p, div');
+            for (const el of labels) {
+                if (/^Password\\s*\\*?$/.test(el.textContent.trim())) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) {
+                        return {x: r.x + r.width / 2, y: r.bottom + 15};
+                    }
                 }
-            });
-            // Enable and make visible
-            el.removeAttribute('disabled');
-            el.removeAttribute('readonly');
-            el.classList.remove('entry-disabled');
-            el.style.display = '';
-            el.style.visibility = 'visible';
-            el.style.opacity = '1';
-            // Set value with native setter to trigger React/Angular bindings
-            const nativeSetter = Object.getOwnPropertyDescriptor(
-                window.HTMLInputElement.prototype, 'value'
-            ).set;
-            nativeSetter.call(el, pwd);
-            el.dispatchEvent(new Event('input', {bubbles: true}));
-            el.dispatchEvent(new Event('change', {bubbles: true}));
-        }""", [password_field, BLS_PASSWORD])
+            }
+            return null;
+        }""")
     except Exception as e:
-        logger.error("Failed to fill password via JS: %s", e)
-        take_screenshot(page, "login_password_fill_error")
-        return False
-    logger.info("Filled password via JS")
+        logger.error("Failed to locate Password label: %s", e)
+        pwd_label_box = None
+
+    if pwd_label_box:
+        x, y = pwd_label_box["x"], pwd_label_box["y"]
+        logger.info("Clicking near Password label at (%d, %d)", x, y)
+        page.mouse.click(x, y)
+        time.sleep(0.5)
+        page.keyboard.type(BLS_PASSWORD, delay=50)
+        logger.info("Typed password via keyboard")
+    else:
+        # Fallback: try to find the input and set value via JS
+        logger.warning("Password label not found, falling back to JS value set")
+        password_field = _find_password_field(page)
+        if not password_field:
+            logger.error("Cannot find password input at all")
+            take_screenshot(page, "login_no_password_field")
+            return False
+        try:
+            page.evaluate("""([el, pwd]) => {
+                el.removeAttribute('disabled');
+                el.removeAttribute('readonly');
+                el.classList.remove('entry-disabled');
+                const nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                nativeSetter.call(el, pwd);
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+            }""", [password_field, BLS_PASSWORD])
+            logger.info("Set password via JS fallback")
+        except Exception as e:
+            logger.error("JS password fallback also failed: %s", e)
+            take_screenshot(page, "login_password_fill_error")
+            return False
     time.sleep(0.5)
 
     # Solve CAPTCHA
