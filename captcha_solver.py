@@ -2,14 +2,16 @@
 
 Supports:
   - hCaptcha (token-based)
-  - BLS number-grid CAPTCHA (image-based, 3×3 grid)
+  - BLS number-grid CAPTCHA (OCR each cell individually)
 """
 
 import base64
 import re
 import time
-import requests
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -113,49 +115,85 @@ def solve_grid_captcha(api_key: str, image_base64: str, instruction: str,
     return cells
 
 
-def solve_coord_captcha(api_key: str, image_base64: str, instruction: str,
-                        max_attempts: int = 30) -> list[tuple[int, int]] | None:
-    """Solve a coordinate-click CAPTCHA via rucaptcha.
-
-    Sends a base64-encoded screenshot + instruction text.
-    Uses coordinatescaptcha method — rucaptcha returns coordinates to click.
-
-    Returns list of (x, y) coordinates relative to the image, or None on failure.
-    """
+def _submit_ocr(api_key: str, image_base64: str) -> str | None:
+    """Submit a single image for OCR text recognition and return request_id."""
     resp = requests.post(RUCAPTCHA_IN, data={
         "key": api_key,
         "method": "base64",
         "body": image_base64,
-        "coordinatescaptcha": 1,
-        "textinstructions": instruction,
+        "numeric": 1,       # only digits
+        "min_len": 2,
+        "max_len": 4,
         "json": 1,
     }, timeout=30)
     data = resp.json()
     if data.get("status") != 1:
-        logger.error("rucaptcha coord submit error: %s", data)
+        logger.error("rucaptcha OCR submit error: %s", data)
         return None
+    return data["request"]
 
-    request_id = data["request"]
-    logger.info("Coord CAPTCHA submitted to rucaptcha, request_id=%s", request_id)
 
-    result = _poll_result(api_key, request_id, max_attempts, first_delay=15, poll_interval=5)
-    if not result:
-        return None
+def ocr_cells_batch(api_key: str, cell_images_b64: list[str],
+                    max_attempts: int = 30) -> list[str | None]:
+    """OCR multiple cell images in parallel via rucaptcha.
 
-    # Parse response like "coordinates:x=112,y=87|x=283,y=87|x=112,y=216"
-    logger.info("Coord CAPTCHA raw response: %s", result)
-    coords = []
-    raw = result.replace("coordinates:", "").strip()
-    for point in raw.split("|"):
-        point = point.strip()
-        mx = re.search(r"x=(\d+)", point)
-        my = re.search(r"y=(\d+)", point)
-        if mx and my:
-            coords.append((int(mx.group(1)), int(my.group(1))))
+    Submits all images at once, then polls for all results.
+    Returns list of OCR texts (or None for failed cells), same order as input.
+    """
+    # Submit all cells in parallel
+    request_ids = []
 
-    if not coords:
-        logger.error("Could not parse coord CAPTCHA response: %s", result)
-        return None
+    def submit_one(img_b64):
+        return _submit_ocr(api_key, img_b64)
 
-    logger.info("Coord CAPTCHA click points: %s", coords)
-    return coords
+    with ThreadPoolExecutor(max_workers=9) as pool:
+        futures = {pool.submit(submit_one, img): idx
+                   for idx, img in enumerate(cell_images_b64)}
+        id_by_idx = {}
+        for future in as_completed(futures):
+            idx = futures[future]
+            req_id = future.result()
+            id_by_idx[idx] = req_id
+
+    request_ids = [id_by_idx.get(i) for i in range(len(cell_images_b64))]
+    submitted = sum(1 for r in request_ids if r)
+    logger.info("Submitted %d/%d cell images for OCR", submitted, len(cell_images_b64))
+
+    # Wait for initial processing
+    time.sleep(10)
+
+    # Poll all results
+    results: list[str | None] = [None] * len(request_ids)
+    pending = {i for i, rid in enumerate(request_ids) if rid}
+
+    for attempt in range(max_attempts):
+        if not pending:
+            break
+
+        still_pending = set()
+        for idx in pending:
+            rid = request_ids[idx]
+            try:
+                resp = requests.get(RUCAPTCHA_RES, params={
+                    "key": api_key,
+                    "action": "get",
+                    "id": rid,
+                    "json": 1,
+                }, timeout=15)
+                data = resp.json()
+                if data.get("status") == 1:
+                    results[idx] = data["request"].strip()
+                elif data.get("request") == "CAPCHA_NOT_READY":
+                    still_pending.add(idx)
+                else:
+                    logger.warning("OCR cell %d error: %s", idx + 1, data)
+            except Exception as e:
+                logger.warning("OCR poll error for cell %d: %s", idx + 1, e)
+                still_pending.add(idx)
+
+        pending = still_pending
+        if pending:
+            time.sleep(5)
+
+    logger.info("OCR results: %s", results)
+    return results

@@ -27,7 +27,7 @@ from playwright.sync_api import sync_playwright, Page, Browser, TimeoutError as 
 
 import base64
 
-from captcha_solver import solve_hcaptcha, solve_grid_captcha, solve_coord_captcha
+from captcha_solver import solve_hcaptcha, ocr_cells_batch
 from notifier import send_telegram
 
 load_dotenv()
@@ -298,8 +298,11 @@ def solve_bls_number_captcha(page: Page) -> bool:
     """Solve the BLS number-grid CAPTCHA.
 
     The CAPTCHA shows: "Please select all boxes with number XXX"
-    with a 3×3 grid of number images.  We screenshot the grid area,
-    send it to rucaptcha as coordinatescaptcha, and click the matching cells.
+    with a 3×3 grid of number images.
+
+    Strategy: screenshot each of the 9 cells individually, OCR them
+    via rucaptcha (simple text recognition), compare with the target
+    number, and click matching cells.
     """
     # Extract the target number from instruction text
     content = page.content()
@@ -310,7 +313,6 @@ def solve_bls_number_captcha(page: Page) -> bool:
         return False
 
     target_number = m.group(1)
-    instruction = f"Click on all boxes that contain the number {target_number}"
     logger.info("BLS number CAPTCHA: target = %s", target_number)
 
     # Find the 9 captcha cell images
@@ -325,77 +327,64 @@ def solve_bls_number_captcha(page: Page) -> bool:
         return False
 
     logger.info("Found %d captcha cells via '%s' strategy", len(cell_boxes), strategy)
-    for i, box in enumerate(cell_boxes):
-        logger.debug("Cell %d: x=%.0f y=%.0f w=%.0f h=%.0f", i + 1,
-                     box['x'], box['y'], box['w'], box['h'])
 
-    # Screenshot just the grid area (bounding box of all 9 cells)
-    min_x = min(b['x'] for b in cell_boxes)
-    min_y = min(b['y'] for b in cell_boxes)
-    max_x = max(b['x'] + b['w'] for b in cell_boxes)
-    max_y = max(b['y'] + b['h'] for b in cell_boxes)
-
-    padding = 5
-    clip = {
-        "x": max(0, min_x - padding),
-        "y": max(0, min_y - padding),
-        "width": (max_x - min_x) + padding * 2,
-        "height": (max_y - min_y) + padding * 2,
-    }
-
-    grid_screenshot = page.screenshot(clip=clip)
-    image_b64 = base64.b64encode(grid_screenshot).decode("ascii")
-    logger.info("Captured captcha grid screenshot: %dx%d, %d bytes",
-                int(clip['width']), int(clip['height']), len(grid_screenshot))
-
-    # Save grid screenshot for debugging
+    # Screenshot each cell individually
     os.makedirs("screenshots", exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    with open(f"screenshots/captcha_grid_{ts}.png", "wb") as f:
-        f.write(grid_screenshot)
+    cell_images_b64 = []
+    for i, box in enumerate(cell_boxes):
+        clip = {
+            "x": box['x'],
+            "y": box['y'],
+            "width": box['w'],
+            "height": box['h'],
+        }
+        cell_png = page.screenshot(clip=clip)
+        cell_b64 = base64.b64encode(cell_png).decode("ascii")
+        cell_images_b64.append(cell_b64)
 
-    # Send to rucaptcha using coordinatescaptcha method
-    # This returns click coordinates relative to the image
-    coords = solve_coord_captcha(RUCAPTCHA_KEY, image_b64, instruction)
-    if not coords:
-        logger.error("rucaptcha failed to solve coord captcha")
+        # Save for debugging
+        with open(f"screenshots/captcha_cell_{ts}_{i+1}.png", "wb") as f:
+            f.write(cell_png)
+
+    logger.info("Captured %d cell screenshots", len(cell_images_b64))
+
+    # OCR all 9 cells in parallel via rucaptcha
+    ocr_results = ocr_cells_batch(RUCAPTCHA_KEY, cell_images_b64)
+    if not ocr_results:
+        logger.error("OCR batch failed")
         return False
 
-    logger.info("rucaptcha returned %d click coordinates", len(coords))
+    # Find cells whose OCR text matches the target number
+    cells_to_click = []
+    for i, ocr_text in enumerate(ocr_results):
+        # Clean OCR result: strip whitespace, keep only digits
+        if ocr_text:
+            cleaned = re.sub(r'\D', '', ocr_text)
+        else:
+            cleaned = ""
+        logger.info("Cell %d OCR: '%s' -> cleaned: '%s' (target: %s)",
+                    i + 1, ocr_text, cleaned, target_number)
+        if cleaned == target_number:
+            cells_to_click.append(i)
 
-    # Map each coordinate (relative to grid screenshot) to cell index, then click
-    # The coordinates are relative to the screenshot image, so add clip offset
-    # to get page-absolute coordinates
-    clicked_cells = set()
-    for img_x, img_y in coords:
-        # Convert from image coords to page coords
-        page_x = clip['x'] + img_x
-        page_y = clip['y'] + img_y
+    if not cells_to_click:
+        logger.error("No cells matched target number %s. OCR results: %s",
+                     target_number, ocr_results)
+        take_screenshot(page, "captcha_no_match")
+        return False
 
-        # Find which cell this coordinate falls in
-        cell_idx = None
-        for i, box in enumerate(cell_boxes):
-            if (box['x'] <= page_x <= box['x'] + box['w'] and
-                    box['y'] <= page_y <= box['y'] + box['h']):
-                cell_idx = i
-                break
+    logger.info("Cells matching target %s: %s", target_number,
+                [c + 1 for c in cells_to_click])
 
-        if cell_idx is not None and cell_idx not in clicked_cells:
-            # Click center of the cell for reliability
-            box = cell_boxes[cell_idx]
-            center_x = box['x'] + box['w'] / 2
-            center_y = box['y'] + box['h'] / 2
-            page.mouse.click(center_x, center_y)
-            clicked_cells.add(cell_idx)
-            logger.info("Clicked captcha cell %d at (%.0f, %.0f) [coord: %d,%d]",
-                        cell_idx + 1, center_x, center_y, img_x, img_y)
-            time.sleep(0.5)
-        elif cell_idx is None:
-            # Coordinate didn't fall in any cell — click it directly anyway
-            page.mouse.click(page_x, page_y)
-            logger.info("Clicked coordinate directly at page (%.0f, %.0f) [coord: %d,%d]",
-                        page_x, page_y, img_x, img_y)
-            time.sleep(0.5)
+    # Click matching cells
+    for idx in cells_to_click:
+        box = cell_boxes[idx]
+        center_x = box['x'] + box['w'] / 2
+        center_y = box['y'] + box['h'] / 2
+        page.mouse.click(center_x, center_y)
+        logger.info("Clicked captcha cell %d at (%.0f, %.0f)", idx + 1, center_x, center_y)
+        time.sleep(0.5)
 
     time.sleep(1)
     take_screenshot(page, "captcha_cells_clicked")
