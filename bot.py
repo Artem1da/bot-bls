@@ -1232,7 +1232,7 @@ def monitor_loop(page: Page, browser: Browser):
 
             if not available or (len(available) == 1 and available[0] == ""):
                 logger.info("No available dates found")
-                notify(f"[Iter {iteration}] No slots available")
+                # Don't spam Telegram — only log locally
                 wait_with_jitter(CHECK_INTERVAL)
                 continue
 
