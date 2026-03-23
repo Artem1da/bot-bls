@@ -6,6 +6,7 @@ Supports:
 """
 
 import base64
+import re
 import time
 import requests
 import logging
@@ -110,3 +111,51 @@ def solve_grid_captcha(api_key: str, image_base64: str, instruction: str,
 
     logger.info("Grid CAPTCHA cells to click: %s", cells)
     return cells
+
+
+def solve_coord_captcha(api_key: str, image_base64: str, instruction: str,
+                        max_attempts: int = 30) -> list[tuple[int, int]] | None:
+    """Solve a coordinate-click CAPTCHA via rucaptcha.
+
+    Sends a base64-encoded screenshot + instruction text.
+    Uses coordinatescaptcha method — rucaptcha returns coordinates to click.
+
+    Returns list of (x, y) coordinates relative to the image, or None on failure.
+    """
+    resp = requests.post(RUCAPTCHA_IN, data={
+        "key": api_key,
+        "method": "base64",
+        "body": image_base64,
+        "coordinatescaptcha": 1,
+        "textinstructions": instruction,
+        "json": 1,
+    }, timeout=30)
+    data = resp.json()
+    if data.get("status") != 1:
+        logger.error("rucaptcha coord submit error: %s", data)
+        return None
+
+    request_id = data["request"]
+    logger.info("Coord CAPTCHA submitted to rucaptcha, request_id=%s", request_id)
+
+    result = _poll_result(api_key, request_id, max_attempts, first_delay=15, poll_interval=5)
+    if not result:
+        return None
+
+    # Parse response like "coordinates:x=112,y=87|x=283,y=87|x=112,y=216"
+    logger.info("Coord CAPTCHA raw response: %s", result)
+    coords = []
+    raw = result.replace("coordinates:", "").strip()
+    for point in raw.split("|"):
+        point = point.strip()
+        mx = re.search(r"x=(\d+)", point)
+        my = re.search(r"y=(\d+)", point)
+        if mx and my:
+            coords.append((int(mx.group(1)), int(my.group(1))))
+
+    if not coords:
+        logger.error("Could not parse coord CAPTCHA response: %s", result)
+        return None
+
+    logger.info("Coord CAPTCHA click points: %s", coords)
+    return coords

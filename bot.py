@@ -27,7 +27,7 @@ from playwright.sync_api import sync_playwright, Page, Browser, TimeoutError as 
 
 import base64
 
-from captcha_solver import solve_hcaptcha, solve_grid_captcha
+from captcha_solver import solve_hcaptcha, solve_grid_captcha, solve_coord_captcha
 from notifier import send_telegram
 
 load_dotenv()
@@ -172,94 +172,124 @@ def _has_number_grid_captcha(page: Page) -> bool:
     return "please select all boxes with number" in content
 
 
-def _find_captcha_container(page: Page):
-    """Find the captcha grid container using JS DOM inspection.
+def _find_captcha_cells(page: Page):
+    """Find the 9 captcha grid cell images by locating the instruction text
+    and searching for images within its parent container.
 
-    Returns (container_element, cell_elements) or (None, []).
+    Returns dict with 'cellBoxes' (list of 9 bounding boxes) and debug info.
     """
-    # Use JS to find the actual structure — dump what we see for debugging
     info = page.evaluate("""() => {
-        const result = { html: '', cellCount: 0, cellTag: '', strategy: '' };
+        const result = { cellBoxes: [], cellCount: 0, strategy: '', debug: '' };
 
-        // Strategy 1: find all images on page — captcha cells are typically
-        // small square images in a grid
-        const allImgs = Array.from(document.querySelectorAll('img'));
-        const smallImgs = allImgs.filter(img => {
-            const r = img.getBoundingClientRect();
-            return r.width > 50 && r.width < 300 && r.height > 50 && r.height < 300;
-        });
-
-        // Strategy 2: find all canvas elements (captcha may render on canvas)
-        const canvases = Array.from(document.querySelectorAll('canvas'));
-        const smallCanvases = canvases.filter(c => {
-            const r = c.getBoundingClientRect();
-            return r.width > 50 && r.width < 300 && r.height > 50 && r.height < 300;
-        });
-
-        // Strategy 3: find divs with onclick or click handlers that look like grid cells
-        const clickableDivs = Array.from(document.querySelectorAll('div[onclick], div[data-id], div.cell, div.captcha-cell, div.box'));
-        const squareDivs = clickableDivs.filter(d => {
-            const r = d.getBoundingClientRect();
-            return r.width > 50 && r.width < 300 && r.height > 50 && r.height < 300;
-        });
-
-        // Determine which strategy found ~9 elements
-        let cells = [];
-        if (smallImgs.length >= 9) {
-            cells = smallImgs.slice(0, 9);
-            result.strategy = 'img';
-            result.cellTag = cells[0].tagName;
-        } else if (smallCanvases.length >= 9) {
-            cells = smallCanvases.slice(0, 9);
-            result.strategy = 'canvas';
-            result.cellTag = 'CANVAS';
-        } else if (squareDivs.length >= 9) {
-            cells = squareDivs.slice(0, 9);
-            result.strategy = 'div';
-            result.cellTag = 'DIV';
-        }
-
-        result.cellCount = cells.length;
-
-        // Get bounding boxes of cells for coordinate-based clicking
-        result.cellBoxes = cells.map(c => {
-            const r = c.getBoundingClientRect();
-            return { x: r.x, y: r.y, w: r.width, h: r.height };
-        });
-
-        // For debugging: dump first few levels of the captcha area
-        const instructionEl = document.querySelector('p, div, span');
+        // Step 1: Find the instruction element ("Please select all boxes with number XXX")
+        // Look for the most specific (smallest) element containing this text
+        let instructionEl = null;
         const allEls = document.querySelectorAll('*');
-        let captchaParent = null;
         for (const el of allEls) {
-            if (el.textContent && /select all boxes with number/i.test(el.textContent) &&
-                el.children.length < 50) {
-                captchaParent = el;
-                break;
+            const txt = el.textContent || '';
+            if (/select all boxes with number/i.test(txt) && el.children.length < 20) {
+                // Prefer the smallest element (fewest children / least text)
+                if (!instructionEl || el.textContent.length < instructionEl.textContent.length) {
+                    instructionEl = el;
+                }
             }
         }
-        if (captchaParent) {
-            result.html = captchaParent.outerHTML.substring(0, 3000);
+
+        if (!instructionEl) {
+            result.debug = 'No instruction element found';
+            return result;
         }
 
-        // Also count all images and canvases for debugging
-        result.totalImgs = allImgs.length;
-        result.totalCanvases = canvases.length;
-        result.smallImgs = smallImgs.length;
-        result.smallCanvases = smallCanvases.length;
-        result.clickableDivs = squareDivs.length;
+        result.debug = 'Instruction: ' + instructionEl.tagName + ' "' +
+            instructionEl.textContent.trim().substring(0, 80) + '"';
+
+        // Step 2: Walk up from instruction to find container with images
+        let container = instructionEl.parentElement;
+        let imgs = [];
+        for (let i = 0; i < 8 && container; i++) {
+            imgs = Array.from(container.querySelectorAll('img'));
+            if (imgs.length >= 9) break;
+            container = container.parentElement;
+        }
+
+        result.debug += ' | Container: ' + (container ? container.tagName + '.' +
+            container.className.substring(0, 50) : 'null') +
+            ' | imgs in container: ' + imgs.length;
+
+        if (imgs.length >= 9) {
+            // Filter to roughly square images that are similar size (captcha cells)
+            const sized = imgs.map(img => {
+                const r = img.getBoundingClientRect();
+                return { el: img, x: r.x, y: r.y, w: r.width, h: r.height, area: r.width * r.height };
+            }).filter(i => i.w > 40 && i.h > 40 && i.area > 2000);
+
+            result.debug += ' | sized imgs: ' + sized.length;
+
+            if (sized.length >= 9) {
+                // Group by similar size — captcha cells should all be ~same dimensions
+                // Find the most common size (within 20% tolerance)
+                const groups = [];
+                for (const img of sized) {
+                    let found = false;
+                    for (const g of groups) {
+                        const ref = g[0];
+                        if (Math.abs(img.w - ref.w) / ref.w < 0.3 &&
+                            Math.abs(img.h - ref.h) / ref.h < 0.3) {
+                            g.push(img);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) groups.push([img]);
+                }
+                // Pick the group with exactly 9 (or closest to 9)
+                groups.sort((a, b) => Math.abs(a.length - 9) - Math.abs(b.length - 9));
+                const best = groups[0];
+                result.debug += ' | groups: ' + groups.map(g => g.length).join(',') +
+                    ' | best group size: ' + best.length;
+
+                if (best.length >= 9) {
+                    // Sort by position: top-to-bottom, left-to-right
+                    best.sort((a, b) => {
+                        const rowDiff = Math.round((a.y - b.y) / (a.h * 0.5));
+                        if (rowDiff !== 0) return rowDiff;
+                        return a.x - b.x;
+                    });
+                    const cells = best.slice(0, 9);
+                    result.cellBoxes = cells.map(c => ({ x: c.x, y: c.y, w: c.w, h: c.h }));
+                    result.cellCount = 9;
+                    result.strategy = 'img-grouped';
+                }
+            }
+        }
+
+        // Fallback: find by canvas elements in container
+        if (result.cellCount < 9 && container) {
+            const canvases = Array.from(container.querySelectorAll('canvas'));
+            if (canvases.length >= 9) {
+                const cells = canvases.slice(0, 9).map(c => {
+                    const r = c.getBoundingClientRect();
+                    return { x: r.x, y: r.y, w: r.width, h: r.height };
+                });
+                result.cellBoxes = cells;
+                result.cellCount = 9;
+                result.strategy = 'canvas';
+            }
+        }
+
+        // Dump container HTML for debugging
+        if (container) {
+            result.html = container.innerHTML.substring(0, 2000);
+        }
 
         return result;
     }""")
 
-    logger.info("Captcha DOM analysis: strategy=%s, cells=%d, imgs=%d (small:%d), "
-                "canvases=%d (small:%d), clickableDivs=%d",
+    logger.info("Captcha cell detection: strategy=%s, cells=%d | %s",
                 info.get('strategy', 'none'), info.get('cellCount', 0),
-                info.get('totalImgs', 0), info.get('smallImgs', 0),
-                info.get('totalCanvases', 0), info.get('smallCanvases', 0),
-                info.get('clickableDivs', 0))
+                info.get('debug', ''))
     if info.get('html'):
-        logger.info("Captcha HTML (first 1000 chars): %s", info['html'][:1000])
+        logger.debug("Captcha container HTML: %s", info['html'][:1500])
 
     return info
 
@@ -269,7 +299,7 @@ def solve_bls_number_captcha(page: Page) -> bool:
 
     The CAPTCHA shows: "Please select all boxes with number XXX"
     with a 3×3 grid of number images.  We screenshot the grid area,
-    send it to rucaptcha, and click the matching cells by coordinates.
+    send it to rucaptcha as coordinatescaptcha, and click the matching cells.
     """
     # Extract the target number from instruction text
     content = page.content()
@@ -280,11 +310,11 @@ def solve_bls_number_captcha(page: Page) -> bool:
         return False
 
     target_number = m.group(1)
-    instruction = f"Select all boxes with number {target_number}"
+    instruction = f"Click on all boxes that contain the number {target_number}"
     logger.info("BLS number CAPTCHA: target = %s", target_number)
 
-    # Analyze the captcha DOM structure
-    captcha_info = _find_captcha_container(page)
+    # Find the 9 captcha cell images
+    captcha_info = _find_captcha_cells(page)
     cell_boxes = captcha_info.get('cellBoxes', [])
     strategy = captcha_info.get('strategy', 'none')
 
@@ -295,6 +325,9 @@ def solve_bls_number_captcha(page: Page) -> bool:
         return False
 
     logger.info("Found %d captcha cells via '%s' strategy", len(cell_boxes), strategy)
+    for i, box in enumerate(cell_boxes):
+        logger.debug("Cell %d: x=%.0f y=%.0f w=%.0f h=%.0f", i + 1,
+                     box['x'], box['y'], box['w'], box['h'])
 
     # Screenshot just the grid area (bounding box of all 9 cells)
     min_x = min(b['x'] for b in cell_boxes)
@@ -302,12 +335,12 @@ def solve_bls_number_captcha(page: Page) -> bool:
     max_x = max(b['x'] + b['w'] for b in cell_boxes)
     max_y = max(b['y'] + b['h'] for b in cell_boxes)
 
-    # Add some padding
+    padding = 5
     clip = {
-        "x": max(0, min_x - 5),
-        "y": max(0, min_y - 5),
-        "width": (max_x - min_x) + 10,
-        "height": (max_y - min_y) + 10,
+        "x": max(0, min_x - padding),
+        "y": max(0, min_y - padding),
+        "width": (max_x - min_x) + padding * 2,
+        "height": (max_y - min_y) + padding * 2,
     }
 
     grid_screenshot = page.screenshot(clip=clip)
@@ -321,26 +354,48 @@ def solve_bls_number_captcha(page: Page) -> bool:
     with open(f"screenshots/captcha_grid_{ts}.png", "wb") as f:
         f.write(grid_screenshot)
 
-    # Send to rucaptcha
-    cells_to_click = solve_grid_captcha(RUCAPTCHA_KEY, image_b64, instruction, rows=3, cols=3)
-    if not cells_to_click:
-        logger.error("rucaptcha failed to solve grid captcha")
+    # Send to rucaptcha using coordinatescaptcha method
+    # This returns click coordinates relative to the image
+    coords = solve_coord_captcha(RUCAPTCHA_KEY, image_b64, instruction)
+    if not coords:
+        logger.error("rucaptcha failed to solve coord captcha")
         return False
 
-    logger.info("rucaptcha says click cells: %s", cells_to_click)
+    logger.info("rucaptcha returned %d click coordinates", len(coords))
 
-    # Click cells by their center coordinates (much more reliable than element selectors)
-    for cell_num in cells_to_click:
-        idx = cell_num - 1  # convert to 0-indexed
-        if 0 <= idx < len(cell_boxes):
-            box = cell_boxes[idx]
+    # Map each coordinate (relative to grid screenshot) to cell index, then click
+    # The coordinates are relative to the screenshot image, so add clip offset
+    # to get page-absolute coordinates
+    clicked_cells = set()
+    for img_x, img_y in coords:
+        # Convert from image coords to page coords
+        page_x = clip['x'] + img_x
+        page_y = clip['y'] + img_y
+
+        # Find which cell this coordinate falls in
+        cell_idx = None
+        for i, box in enumerate(cell_boxes):
+            if (box['x'] <= page_x <= box['x'] + box['w'] and
+                    box['y'] <= page_y <= box['y'] + box['h']):
+                cell_idx = i
+                break
+
+        if cell_idx is not None and cell_idx not in clicked_cells:
+            # Click center of the cell for reliability
+            box = cell_boxes[cell_idx]
             center_x = box['x'] + box['w'] / 2
             center_y = box['y'] + box['h'] / 2
             page.mouse.click(center_x, center_y)
-            logger.info("Clicked captcha cell %d at (%.0f, %.0f)", cell_num, center_x, center_y)
+            clicked_cells.add(cell_idx)
+            logger.info("Clicked captcha cell %d at (%.0f, %.0f) [coord: %d,%d]",
+                        cell_idx + 1, center_x, center_y, img_x, img_y)
             time.sleep(0.5)
-        else:
-            logger.warning("Cell number %d out of range (have %d cells)", cell_num, len(cell_boxes))
+        elif cell_idx is None:
+            # Coordinate didn't fall in any cell — click it directly anyway
+            page.mouse.click(page_x, page_y)
+            logger.info("Clicked coordinate directly at page (%.0f, %.0f) [coord: %d,%d]",
+                        page_x, page_y, img_x, img_y)
+            time.sleep(0.5)
 
     time.sleep(1)
     take_screenshot(page, "captcha_cells_clicked")
