@@ -703,13 +703,19 @@ def _find_visible_kendo_dropdown(page: Page, label_text: str) -> "str | None":
 def _select_kendo_dropdown(page: Page, input_id: str, value_name: str, label: str) -> bool:
     """Select a value in a Kendo dropdown by its display text.
 
-    Uses the Kendo API: $(selector).data('kendoDropDownList').select(fn).
+    Uses the Kendo API.  Since BLS sets autoBind:false, we must call
+    dataSource.read() first to populate the dropdown items.
     """
     try:
         result = page.evaluate("""([inputId, valueName]) => {
             const widget = $("#" + inputId).data("kendoDropDownList");
             if (!widget) return {ok: false, error: "No Kendo widget for #" + inputId};
-            // Find item by Name text
+
+            // autoBind:false means data isn't loaded yet — force it
+            if (widget.dataSource.data().length === 0) {
+                widget.dataSource.read();
+            }
+
             const ds = widget.dataSource.data();
             let idx = -1;
             for (let i = 0; i < ds.length; i++) {
@@ -719,8 +725,10 @@ def _select_kendo_dropdown(page: Page, input_id: str, value_name: str, label: st
                 }
             }
             if (idx === -1) {
-                const names = ds.map(d => d.Name);
-                return {ok: false, error: "Value '" + valueName + "' not in " + JSON.stringify(names)};
+                const names = [];
+                for (let i = 0; i < ds.length; i++) names.push(ds[i].Name);
+                return {ok: false, error: "Value '" + valueName + "' not in " + JSON.stringify(names),
+                        count: ds.length};
             }
             widget.select(idx);
             widget.trigger("change");
@@ -1131,6 +1139,14 @@ def monitor_loop(page: Page, browser: Browser):
             time.sleep(3)
 
             take_screenshot(page, "after_form_submit")
+
+            # Check for rate-limit after form submit
+            if is_rate_limited(page):
+                backoff = min(max(backoff * 2, RATE_LIMIT_COOLDOWN), MAX_BACKOFF)
+                logger.warning("Rate-limited after form submit! Cooling down %d s", backoff)
+                notify(f"[Iter {iteration}] Rate-limited after form submit. Cooling down {backoff}s.")
+                logged_in = False
+                continue
 
             # Solve CAPTCHA after form submit if one appears
             if _has_number_grid_captcha(page):
