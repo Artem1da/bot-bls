@@ -494,57 +494,76 @@ def do_login(page: Page) -> bool:
     # ── Step 2: Password + Number CAPTCHA ──
     logger.info("Login step 2: password + captcha...")
 
-    # Fill password by finding input[type='password'], scrolling to it,
-    # clicking its center coordinates, and typing via keyboard.
-    # BLS hides the input behind overlays so Playwright's .click()/.fill()
-    # don't work, but mouse.click at exact coordinates does.
+    # BLS anti-bot: there are ~10 identical password inputs, but only ONE
+    # is truly visible (not hidden by CSS).  We find the visible one by
+    # checking computed style and bounding rect, scroll to it, and type.
     try:
         pwd_coords = page.evaluate("""() => {
-            const inp = document.querySelector("input[type='password']");
-            if (!inp) return null;
-            inp.scrollIntoView({block: 'center'});
-            // Small delay for scroll to settle is handled by caller
-            const r = inp.getBoundingClientRect();
-            if (r.width > 0 && r.height > 0) {
-                return {x: r.x + r.width / 2, y: r.y + r.height / 2,
-                        w: r.width, h: r.height};
+            const inputs = document.querySelectorAll("input[type='password']");
+            for (const inp of inputs) {
+                const style = window.getComputedStyle(inp);
+                if (style.display === 'none' || style.visibility === 'hidden'
+                    || style.opacity === '0') continue;
+                // Also check parent visibility
+                const pstyle = window.getComputedStyle(inp.parentElement);
+                if (pstyle.display === 'none' || pstyle.visibility === 'hidden'
+                    || pstyle.opacity === '0') continue;
+                const r = inp.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) {
+                    inp.scrollIntoView({block: 'center'});
+                    return {id: inp.id, found: inputs.length};
+                }
             }
             return null;
         }""")
     except Exception as e:
-        logger.error("Failed to locate password input: %s", e)
+        logger.error("Failed to locate visible password input: %s", e)
         pwd_coords = None
 
     if pwd_coords:
+        logger.info("Found %d password inputs, visible one: #%s",
+                     pwd_coords["found"], pwd_coords["id"])
         time.sleep(0.3)  # let scrollIntoView settle
         # Re-read coordinates after scroll
         try:
-            pwd_coords = page.evaluate("""() => {
-                const inp = document.querySelector("input[type='password']");
+            coords = page.evaluate("""(inputId) => {
+                const inp = document.getElementById(inputId);
                 if (!inp) return null;
                 const r = inp.getBoundingClientRect();
                 return {x: r.x + r.width / 2, y: r.y + r.height / 2,
                         w: r.width, h: r.height};
-            }""")
-        except Exception:
-            pass
-        x, y = pwd_coords["x"], pwd_coords["y"]
+            }""", pwd_coords["id"])
+        except Exception as e:
+            logger.error("Failed to get coords for #%s: %s", pwd_coords["id"], e)
+            take_screenshot(page, "login_password_coords_error")
+            return False
+
+        x, y = coords["x"], coords["y"]
         logger.info("Password input at (%d, %d) size %dx%d, clicking...",
-                     x, y, pwd_coords["w"], pwd_coords["h"])
+                     x, y, coords["w"], coords["h"])
         page.mouse.click(x, y)
         time.sleep(0.3)
         # Verify focus landed on the password field
         focused_tag = page.evaluate("() => document.activeElement?.tagName")
         focused_type = page.evaluate("() => document.activeElement?.type")
         logger.info("Active element after click: %s type=%s", focused_tag, focused_type)
+        if focused_type != "password":
+            logger.warning("Click didn't focus password field, trying focus() via JS")
+            page.evaluate("""(inputId) => {
+                const inp = document.getElementById(inputId);
+                inp.removeAttribute('disabled');
+                inp.removeAttribute('readonly');
+                inp.classList.remove('entry-disabled');
+                inp.focus();
+            }""", pwd_coords["id"])
+            time.sleep(0.2)
         page.keyboard.type(BLS_PASSWORD, delay=50)
         logger.info("Typed password via keyboard")
         take_screenshot(page, "after_password_type")
     else:
-        logger.error("Cannot find password input[type='password']")
+        logger.error("Cannot find any visible password input (out of all type=password)")
         take_screenshot(page, "login_no_password_field")
         return False
-    time.sleep(0.5)
     time.sleep(0.5)
 
     # Solve CAPTCHA
