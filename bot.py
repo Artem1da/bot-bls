@@ -501,17 +501,29 @@ def do_login(page: Page) -> bool:
         take_screenshot(page, "login_no_password_field")
         return False
 
-    # BLS marks the password field with "entry-disabled" class and overlays
-    # hide it, so Playwright's click/fill won't work.  Use JS to set value.
+    # BLS hides the password field behind overlays (z-index:10000) and marks
+    # it with "entry-disabled" class.  Remove overlays, enable the field,
+    # then set value via JS since Playwright can't click invisible elements.
     try:
         page.evaluate("""([el, pwd]) => {
+            // Remove any overlays covering the password field
+            document.querySelectorAll('[class*="overlay"]').forEach(o => {
+                if (o.style.zIndex && parseInt(o.style.zIndex) > 999) {
+                    o.style.display = 'none';
+                }
+            });
+            // Enable and make visible
             el.removeAttribute('disabled');
             el.removeAttribute('readonly');
             el.classList.remove('entry-disabled');
             el.style.display = '';
             el.style.visibility = 'visible';
-            el.focus();
-            el.value = pwd;
+            el.style.opacity = '1';
+            // Set value with native setter to trigger React/Angular bindings
+            const nativeSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value'
+            ).set;
+            nativeSetter.call(el, pwd);
             el.dispatchEvent(new Event('input', {bubbles: true}));
             el.dispatchEvent(new Event('change', {bubbles: true}));
         }""", [password_field, BLS_PASSWORD])
@@ -610,57 +622,82 @@ def click_book_appointment(page: Page) -> bool:
     return False
 
 
-def fill_form(page: Page):
-    """Fill in the visa type selection form."""
+def fill_form(page: Page) -> bool:
+    """Fill in the visa type selection form.
+
+    Returns True if at least one dropdown was found and filled.
+    """
     # The BLS form has dropdowns that load sequentially.
     # We try common selector patterns used by BLS sites.
+    filled_count = 0
 
-    # Category (Normal / Prime Time)
-    for sel in ["#AppointmentCategoryId", "#category", "select[name='AppointmentCategoryId']"]:
+    # Log all <select> elements on page for debugging
+    all_selects = page.query_selector_all("select")
+    logger.info("Found %d <select> elements on page", len(all_selects))
+    for i, s in enumerate(all_selects):
         try:
-            if page.query_selector(sel):
-                select_dropdown(page, sel, CATEGORY)
-                break
+            sid = s.get_attribute("id") or ""
+            sname = s.get_attribute("name") or ""
+            opts = s.query_selector_all("option")
+            opt_texts = [o.text_content().strip() for o in opts[:5]]
+            logger.info("  select[%d] id=%s name=%s options=%s", i, sid, sname, opt_texts)
         except Exception:
-            continue
+            pass
 
-    # Location
-    for sel in ["#LocationId", "#centre", "#location", "select[name='LocationId']"]:
-        try:
-            if page.query_selector(sel):
-                select_dropdown(page, sel, LOCATION)
-                break
-        except Exception:
-            continue
+    # Each dropdown: list of (selectors, value, label)
+    dropdowns = [
+        (["#AppointmentCategoryId", "#category", "select[name='AppointmentCategoryId']"],
+         CATEGORY, "Category"),
+        (["#LocationId", "#centre", "#location", "select[name='LocationId']"],
+         LOCATION, "Location"),
+        (["#VisaTypeId", "#visa_type", "select[name='VisaTypeId']"],
+         VISA_TYPE, "Visa Type"),
+    ]
 
-    # Visa Type
-    for sel in ["#VisaTypeId", "#visa_type", "select[name='VisaTypeId']"]:
-        try:
-            if page.query_selector(sel):
-                select_dropdown(page, sel, VISA_TYPE)
-                break
-        except Exception:
-            continue
+    for selectors, value, label in dropdowns:
+        found = False
+        for sel in selectors:
+            try:
+                el = page.query_selector(sel)
+                if el:
+                    select_dropdown(page, sel, value)
+                    filled_count += 1
+                    found = True
+                    break
+            except Exception as e:
+                logger.warning("Failed to select '%s' in %s: %s", value, sel, e)
+                continue
+        if not found:
+            logger.warning("Could not find dropdown for %s", label)
 
     time.sleep(2)
 
-    # Visa Sub Type
-    for sel in ["#VisaSubTypeId", "#visa_sub_type", "select[name='VisaSubTypeId']"]:
-        try:
-            if page.query_selector(sel):
-                select_dropdown(page, sel, VISA_SUB_TYPE)
-                break
-        except Exception:
-            continue
+    # These depend on previous selections loading
+    dependent_dropdowns = [
+        (["#VisaSubTypeId", "#visa_sub_type", "select[name='VisaSubTypeId']"],
+         VISA_SUB_TYPE, "Visa Sub Type"),
+        (["#AppointmentForId", "#appointment_for", "select[name='AppointmentForId']"],
+         APPOINTMENT_FOR, "Appointment For"),
+    ]
 
-    # Appointment for (Individual / Family)
-    for sel in ["#AppointmentForId", "#appointment_for", "select[name='AppointmentForId']"]:
-        try:
-            if page.query_selector(sel):
-                select_dropdown(page, sel, APPOINTMENT_FOR)
-                break
-        except Exception:
-            continue
+    for selectors, value, label in dependent_dropdowns:
+        found = False
+        for sel in selectors:
+            try:
+                el = page.query_selector(sel)
+                if el:
+                    select_dropdown(page, sel, value)
+                    filled_count += 1
+                    found = True
+                    break
+            except Exception as e:
+                logger.warning("Failed to select '%s' in %s: %s", value, sel, e)
+                continue
+        if not found:
+            logger.warning("Could not find dropdown for %s", label)
+
+    logger.info("Filled %d/%d dropdowns", filled_count, len(dropdowns) + len(dependent_dropdowns))
+    return filled_count > 0
 
 
 def solve_and_submit_captcha(page: Page) -> bool:
@@ -924,47 +961,80 @@ def monitor_loop(page: Page, browser: Browser):
                 logged_in = False
                 continue
 
-            take_screenshot(page, "appointment_page")
+            take_screenshot(page, "after_book_click")
 
-            # Dump page selectors for debugging (first time after login)
+            # ── Solve CAPTCHA that appears BEFORE the form ──
+            # BLS shows a "Captcha Verification" page after clicking Book Now.
+            if _has_number_grid_captcha(page):
+                logger.info("Number-grid CAPTCHA before form, solving...")
+                if not solve_bls_number_captcha(page):
+                    logger.error("Pre-form CAPTCHA solve failed, retrying")
+                    wait_with_jitter(CHECK_INTERVAL)
+                    continue
+                # Click Submit to pass the captcha page
+                click_submit(page)
+                time.sleep(5)
+                take_screenshot(page, "after_pre_form_captcha")
+
+            if page.query_selector(".h-captcha, iframe[src*='hcaptcha']"):
+                logger.info("hCaptcha before form, solving...")
+                if not solve_and_submit_captcha(page):
+                    logger.error("Pre-form hCaptcha solve failed, retrying")
+                    wait_with_jitter(CHECK_INTERVAL)
+                    continue
+                click_submit(page)
+                time.sleep(5)
+                take_screenshot(page, "after_pre_form_hcaptcha")
+
+            # ── Now we should be on the form page with dropdowns ──
+            take_screenshot(page, "form_page")
+
+            # Dump page selectors for debugging (first iterations)
             if iteration <= 2:
                 dump_form_structure(page)
 
-            # Fill the visa type form
-            fill_form(page)
+            # Fill the visa type form (Category, Location, etc.)
+            form_ok = fill_form(page)
             time.sleep(2)
 
             take_screenshot(page, "form_filled")
 
-            # Click submit/book to proceed
+            if not form_ok:
+                logger.warning("No dropdowns found — page may not have loaded correctly")
+                take_screenshot(page, "form_not_found")
+                # Don't proceed to check dates, retry next iteration
+                logged_in = False
+                wait_with_jitter(CHECK_INTERVAL)
+                continue
+
+            # Click submit/book to proceed to the calendar
             click_submit(page)
             time.sleep(3)
 
-            take_screenshot(page, "after_submit")
+            take_screenshot(page, "after_form_submit")
 
-            # Solve CAPTCHA after submit (BLS shows number-grid or hCaptcha here)
+            # Solve CAPTCHA after form submit if one appears
             if _has_number_grid_captcha(page):
-                logger.info("Number-grid CAPTCHA after submit, solving...")
+                logger.info("Number-grid CAPTCHA after form submit, solving...")
                 if not solve_bls_number_captcha(page):
-                    logger.error("Post-submit CAPTCHA solve failed, retrying")
+                    logger.error("Post-form CAPTCHA solve failed, retrying")
                     wait_with_jitter(CHECK_INTERVAL)
                     continue
-                # Click submit again after solving captcha
                 click_submit(page)
                 time.sleep(5)
-                take_screenshot(page, "after_captcha_submit")
+                take_screenshot(page, "after_post_form_captcha")
 
             if page.query_selector(".h-captcha, iframe[src*='hcaptcha']"):
-                logger.info("hCaptcha after submit, solving...")
+                logger.info("hCaptcha after form submit, solving...")
                 if not solve_and_submit_captcha(page):
-                    logger.error("Post-submit hCaptcha solve failed, retrying")
+                    logger.error("Post-form hCaptcha solve failed, retrying")
                     wait_with_jitter(CHECK_INTERVAL)
                     continue
                 click_submit(page)
                 time.sleep(5)
-                take_screenshot(page, "after_hcaptcha_submit")
+                take_screenshot(page, "after_post_form_hcaptcha")
 
-            # Check for available dates
+            # ── Check for available dates ──
             available, full_cap = extract_dates(page)
             logger.info("Available dates: %s", available)
             logger.info("Full capacity dates: %s", full_cap)
