@@ -494,7 +494,20 @@ def do_login(page: Page) -> bool:
     # ── Step 2: Password + Number CAPTCHA ──
     logger.info("Login step 2: password + captcha...")
 
-    # Solve BLS number-grid CAPTCHA first (it's above the password field)
+    # Fill password FIRST (before captcha, so it's ready when we click Submit)
+    password_field = _find_password_field(page)
+    if not password_field:
+        logger.error("Cannot find password input")
+        take_screenshot(page, "login_no_password_field")
+        return False
+
+    password_field.click()
+    time.sleep(0.3)
+    password_field.fill(BLS_PASSWORD)
+    logger.info("Filled password")
+    time.sleep(0.5)
+
+    # Solve CAPTCHA
     if _has_number_grid_captcha(page):
         logger.info("Number-grid CAPTCHA detected on password page")
         if not solve_bls_number_captcha(page):
@@ -506,19 +519,8 @@ def do_login(page: Page) -> bool:
             logger.error("Failed to solve login hCaptcha")
             return False
 
-    # Fill password
-    password_field = _find_password_field(page)
-    if not password_field:
-        logger.error("Cannot find password input")
-        take_screenshot(page, "login_no_password_field")
-        return False
-
-    password_field.click()
-    time.sleep(0.3)
-    password_field.fill(BLS_PASSWORD)
-    logger.info("Filled password")
-    time.sleep(1)
-    take_screenshot(page, "password_filled")
+    time.sleep(0.5)
+    take_screenshot(page, "password_and_captcha_done")
 
     # Click Submit — this also triggers navigation
     submit_clicked = False
