@@ -172,23 +172,28 @@ def _has_number_grid_captcha(page: Page) -> bool:
     return "please select all boxes with number" in content
 
 
-def _find_captcha_cells(page: Page):
-    """Find the 9 captcha grid cell images by locating the instruction text
-    and searching for images within its parent container.
+def _find_captcha_grid(page: Page) -> dict:
+    """Find the captcha grid area and target number atomically.
 
-    Returns dict with 'cellBoxes' (list of 9 bounding boxes) and debug info.
+    Instead of trying to find individual cell <img> elements (BLS layers
+    multiple images per cell for obfuscation), we find the visual grid
+    container and divide it into a 3×3 grid mathematically.
+
+    Returns dict with:
+      - targetNumber: the number to find
+      - gridBox: {x, y, w, h} bounding box of the 3×3 grid area
+      - cellBoxes: list of 9 {x, y, w, h} boxes (row-major order)
+      - debug: debug info string
     """
     info = page.evaluate("""() => {
-        const result = { cellBoxes: [], cellCount: 0, strategy: '', debug: '' };
+        const result = { targetNumber: '', gridBox: null, cellBoxes: [], debug: '' };
 
-        // Step 1: Find the instruction element ("Please select all boxes with number XXX")
-        // Look for the most specific (smallest) element containing this text
+        // Step 1: Find the instruction element and extract target number
         let instructionEl = null;
         const allEls = document.querySelectorAll('*');
         for (const el of allEls) {
             const txt = el.textContent || '';
             if (/select all boxes with number/i.test(txt) && el.children.length < 20) {
-                // Prefer the smallest element (fewest children / least text)
                 if (!instructionEl || el.textContent.length < instructionEl.textContent.length) {
                     instructionEl = el;
                 }
@@ -200,10 +205,14 @@ def _find_captcha_cells(page: Page):
             return result;
         }
 
-        result.debug = 'Instruction: ' + instructionEl.tagName + ' "' +
-            instructionEl.textContent.trim().substring(0, 80) + '"';
+        const instrText = instructionEl.textContent.trim();
+        const numMatch = instrText.match(/number\s+(\d+)/i);
+        if (numMatch) {
+            result.targetNumber = numMatch[1];
+        }
+        result.debug = 'Instruction: "' + instrText.substring(0, 80) + '"';
 
-        // Step 2: Walk up from instruction to find container with images
+        // Step 2: Walk up from instruction to find a container with images
         let container = instructionEl.parentElement;
         let imgs = [];
         for (let i = 0; i < 8 && container; i++) {
@@ -212,85 +221,67 @@ def _find_captcha_cells(page: Page):
             container = container.parentElement;
         }
 
-        result.debug += ' | Container: ' + (container ? container.tagName + '.' +
-            container.className.substring(0, 50) : 'null') +
-            ' | imgs in container: ' + imgs.length;
-
-        if (imgs.length >= 9) {
-            // Filter to roughly square images that are similar size (captcha cells)
-            const sized = imgs.map(img => {
-                const r = img.getBoundingClientRect();
-                return { el: img, x: r.x, y: r.y, w: r.width, h: r.height, area: r.width * r.height };
-            }).filter(i => i.w > 40 && i.h > 40 && i.area > 2000);
-
-            result.debug += ' | sized imgs: ' + sized.length;
-
-            if (sized.length >= 9) {
-                // Group by similar size — captcha cells should all be ~same dimensions
-                // Find the most common size (within 20% tolerance)
-                const groups = [];
-                for (const img of sized) {
-                    let found = false;
-                    for (const g of groups) {
-                        const ref = g[0];
-                        if (Math.abs(img.w - ref.w) / ref.w < 0.3 &&
-                            Math.abs(img.h - ref.h) / ref.h < 0.3) {
-                            g.push(img);
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) groups.push([img]);
-                }
-                // Pick the group with exactly 9 (or closest to 9)
-                groups.sort((a, b) => Math.abs(a.length - 9) - Math.abs(b.length - 9));
-                const best = groups[0];
-                result.debug += ' | groups: ' + groups.map(g => g.length).join(',') +
-                    ' | best group size: ' + best.length;
-
-                if (best.length >= 9) {
-                    // Sort by position: top-to-bottom, left-to-right
-                    best.sort((a, b) => {
-                        const rowDiff = Math.round((a.y - b.y) / (a.h * 0.5));
-                        if (rowDiff !== 0) return rowDiff;
-                        return a.x - b.x;
-                    });
-                    const cells = best.slice(0, 9);
-                    result.cellBoxes = cells.map(c => ({ x: c.x, y: c.y, w: c.w, h: c.h }));
-                    result.cellCount = 9;
-                    result.strategy = 'img-grouped';
-                }
-            }
+        if (!container || imgs.length < 9) {
+            result.debug += ' | No container with enough images found';
+            return result;
         }
 
-        // Fallback: find by canvas elements in container
-        if (result.cellCount < 9 && container) {
-            const canvases = Array.from(container.querySelectorAll('canvas'));
-            if (canvases.length >= 9) {
-                const cells = canvases.slice(0, 9).map(c => {
-                    const r = c.getBoundingClientRect();
-                    return { x: r.x, y: r.y, w: r.width, h: r.height };
+        result.debug += ' | Container: ' + container.tagName +
+            ' | imgs: ' + imgs.length;
+
+        // Step 3: Find the grid bounding box.
+        // Get all images with reasonable size, then find the bounding box of
+        // the cluster that forms the 3×3 grid.
+        const imgRects = imgs.map(img => {
+            const r = img.getBoundingClientRect();
+            return { x: r.x, y: r.y, w: r.width, h: r.height, area: r.width * r.height };
+        }).filter(i => i.w > 30 && i.h > 30 && i.area > 1000);
+
+        if (imgRects.length < 9) {
+            result.debug += ' | Not enough sized images: ' + imgRects.length;
+            return result;
+        }
+
+        // The grid images cluster together — find bounding box of ALL sized images.
+        // This gives us the overall grid area.
+        const instrRect = instructionEl.getBoundingClientRect();
+
+        // Filter images that are BELOW the instruction text (grid is below instruction)
+        const belowInstr = imgRects.filter(r => r.y >= instrRect.bottom - 5);
+        const targetImgs = belowInstr.length >= 9 ? belowInstr : imgRects;
+
+        const minX = Math.min(...targetImgs.map(r => r.x));
+        const minY = Math.min(...targetImgs.map(r => r.y));
+        const maxX = Math.max(...targetImgs.map(r => r.x + r.w));
+        const maxY = Math.max(...targetImgs.map(r => r.y + r.h));
+
+        const gridBox = { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+        result.gridBox = gridBox;
+
+        result.debug += ' | Grid box: ' + Math.round(gridBox.x) + ',' +
+            Math.round(gridBox.y) + ' ' + Math.round(gridBox.w) + 'x' +
+            Math.round(gridBox.h) + ' (from ' + targetImgs.length + ' imgs)';
+
+        // Step 4: Divide grid into 3×3 cells
+        const cellW = gridBox.w / 3;
+        const cellH = gridBox.h / 3;
+        for (let row = 0; row < 3; row++) {
+            for (let col = 0; col < 3; col++) {
+                result.cellBoxes.push({
+                    x: gridBox.x + col * cellW,
+                    y: gridBox.y + row * cellH,
+                    w: cellW,
+                    h: cellH,
                 });
-                result.cellBoxes = cells;
-                result.cellCount = 9;
-                result.strategy = 'canvas';
             }
-        }
-
-        // Dump container HTML for debugging
-        if (container) {
-            result.html = container.innerHTML.substring(0, 2000);
         }
 
         return result;
     }""")
 
-    logger.info("Captcha cell detection: strategy=%s, cells=%d | %s",
-                info.get('strategy', 'none'), info.get('cellCount', 0),
+    logger.info("Captcha grid detection: target=%s, cells=%d | %s",
+                info.get('targetNumber', ''), len(info.get('cellBoxes', [])),
                 info.get('debug', ''))
-    if info.get('html'):
-        logger.debug("Captcha container HTML: %s", info['html'][:1500])
-
     return info
 
 
@@ -300,44 +291,39 @@ def solve_bls_number_captcha(page: Page) -> bool:
     The CAPTCHA shows: "Please select all boxes with number XXX"
     with a 3×3 grid of number images.
 
-    Strategy: screenshot each of the 9 cells individually, OCR them
-    via rucaptcha (simple text recognition), compare with the target
-    number, and click matching cells.
+    Strategy: find the grid container, divide into 3×3 regions, screenshot
+    each region, OCR via rucaptcha, compare with target, click matches.
     """
-    # Extract the target number from instruction text
-    content = page.content()
-    m = re.search(r"[Pp]lease select all boxes with number\s+(\d+)", content)
-    if not m:
+    # Find grid and extract target number atomically (same JS evaluate)
+    captcha_info = _find_captcha_grid(page)
+    target_number = captcha_info.get('targetNumber', '')
+    cell_boxes = captcha_info.get('cellBoxes', [])
+
+    if not target_number:
         logger.error("Cannot extract target number from captcha instruction")
         take_screenshot(page, "captcha_no_instruction")
         return False
 
-    target_number = m.group(1)
-    logger.info("BLS number CAPTCHA: target = %s", target_number)
-
-    # Find the 9 captcha cell images
-    captcha_info = _find_captcha_cells(page)
-    cell_boxes = captcha_info.get('cellBoxes', [])
-    strategy = captcha_info.get('strategy', 'none')
-
     if len(cell_boxes) < 9:
-        logger.error("Could not find 9 captcha cells (found %d via '%s')",
-                     len(cell_boxes), strategy)
+        logger.error("Could not find captcha grid cells (found %d)", len(cell_boxes))
         take_screenshot(page, "captcha_no_cells")
         return False
 
-    logger.info("Found %d captcha cells via '%s' strategy", len(cell_boxes), strategy)
+    logger.info("BLS number CAPTCHA: target=%s, %d cells detected", target_number, len(cell_boxes))
 
     # Screenshot each cell individually
     os.makedirs("screenshots", exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     cell_images_b64 = []
     for i, box in enumerate(cell_boxes):
+        # Inset by 10% to avoid grid borders / gaps between cells
+        inset_x = box['w'] * 0.10
+        inset_y = box['h'] * 0.10
         clip = {
-            "x": box['x'],
-            "y": box['y'],
-            "width": box['w'],
-            "height": box['h'],
+            "x": box['x'] + inset_x,
+            "y": box['y'] + inset_y,
+            "width": box['w'] - 2 * inset_x,
+            "height": box['h'] - 2 * inset_y,
         }
         cell_png = page.screenshot(clip=clip)
         cell_b64 = base64.b64encode(cell_png).decode("ascii")
