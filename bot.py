@@ -15,6 +15,7 @@ Usage:
 
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -49,6 +50,10 @@ MIN_DATE = date.fromisoformat(MIN_DATE_STR)
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
+
+# Rate-limit backoff settings
+MAX_BACKOFF = 600  # 10 minutes max wait
+JITTER_RANGE = 0.3  # ±30% random jitter on intervals
 
 # ── Logging ─────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -380,6 +385,27 @@ def try_book_date(page: Page, target_date: str) -> bool:
     return False
 
 
+def is_rate_limited(page: Page) -> bool:
+    """Check if the page shows a rate-limit / Too Many Requests error."""
+    content = page.content().lower()
+    indicators = [
+        "too many requests",
+        "rate limit",
+        "excessive requests",
+        "try again after some time",
+        "429",
+    ]
+    return any(ind in content for ind in indicators)
+
+
+def wait_with_jitter(seconds: float):
+    """Sleep for `seconds` with ±JITTER_RANGE random jitter."""
+    jitter = seconds * random.uniform(-JITTER_RANGE, JITTER_RANGE)
+    actual = max(1, seconds + jitter)
+    logger.info("Waiting %.0f seconds (base %d ± jitter)", actual, seconds)
+    time.sleep(actual)
+
+
 def take_screenshot(page: Page, name: str):
     """Save a screenshot for debugging."""
     os.makedirs("screenshots", exist_ok=True)
@@ -423,6 +449,7 @@ def monitor_loop(page: Page, browser: Browser):
     """Main monitoring loop."""
     iteration = 0
     logged_in = False
+    backoff = 0  # current rate-limit backoff in seconds
 
     while True:
         iteration += 1
@@ -433,6 +460,17 @@ def monitor_loop(page: Page, browser: Browser):
             page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
             time.sleep(3)
 
+            # ── Rate-limit detection ──
+            if is_rate_limited(page):
+                backoff = min(max(backoff * 2, 60), MAX_BACKOFF)
+                logger.warning("Rate-limited by BLS! Backing off for %d s", backoff)
+                notify(f"[Iter {iteration}] Rate-limited. Waiting {backoff}s before retry.")
+                take_screenshot(page, "rate_limited")
+                wait_with_jitter(backoff)
+                continue
+            # Reset backoff on success
+            backoff = 0
+
             take_screenshot(page, "page_loaded")
             logger.info("Page: %s | URL: %s", page.title(), page.url)
 
@@ -442,11 +480,18 @@ def monitor_loop(page: Page, browser: Browser):
                     logged_in = do_login(page)
                     if not logged_in:
                         logger.error("Login failed, retrying next iteration")
-                        time.sleep(CHECK_INTERVAL)
+                        wait_with_jitter(CHECK_INTERVAL)
                         continue
                     # After login, navigate back to appointment page
+                    time.sleep(5)  # extra delay before second navigation
                     page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
                     time.sleep(3)
+                    if is_rate_limited(page):
+                        backoff = 60
+                        logger.warning("Rate-limited after login! Backing off %d s", backoff)
+                        wait_with_jitter(backoff)
+                        logged_in = False
+                        continue
                 else:
                     logged_in = True  # No credentials = no login needed
 
@@ -465,7 +510,7 @@ def monitor_loop(page: Page, browser: Browser):
                 logger.info("CAPTCHA detected, solving...")
                 if not solve_and_submit_captcha(page):
                     logger.error("CAPTCHA solve failed, retrying next iteration")
-                    time.sleep(CHECK_INTERVAL)
+                    wait_with_jitter(CHECK_INTERVAL)
                     continue
 
             # Click submit/book to proceed
@@ -482,14 +527,14 @@ def monitor_loop(page: Page, browser: Browser):
             if not available or (len(available) == 1 and available[0] == ""):
                 logger.info("No available dates found")
                 notify(f"[Iter {iteration}] No slots available")
-                time.sleep(CHECK_INTERVAL)
+                wait_with_jitter(CHECK_INTERVAL)
                 continue
 
             # Filter dates
             good_dates = filter_dates(available, MIN_DATE)
             if not good_dates:
                 logger.info("Available dates exist but none >= %s", MIN_DATE)
-                time.sleep(CHECK_INTERVAL)
+                wait_with_jitter(CHECK_INTERVAL)
                 continue
 
             # Found matching dates!
@@ -519,7 +564,7 @@ def monitor_loop(page: Page, browser: Browser):
             take_screenshot(page, "error")
             logged_in = False
 
-        time.sleep(CHECK_INTERVAL)
+        wait_with_jitter(CHECK_INTERVAL)
 
 
 def main():
