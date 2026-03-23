@@ -28,7 +28,7 @@ from playwright.sync_api import sync_playwright, Page, Browser, TimeoutError as 
 import base64
 
 from captcha_solver import solve_hcaptcha, ocr_cells_batch
-from notifier import send_telegram
+from notifier import send_telegram, check_telegram_commands
 
 load_dotenv()
 
@@ -1041,6 +1041,31 @@ def monitor_loop(page: Page, browser: Browser):
     while True:
         iteration += 1
         logger.info("── Iteration %d ──", iteration)
+
+        # ── Check for Telegram commands ──
+        cmd = check_telegram_commands(TG_TOKEN, TG_CHAT)
+        if cmd:
+            if cmd in ("/stop", "/pause"):
+                notify("Bot stopped by /stop command. Send /start to resume.")
+                logger.info("Bot paused by Telegram /stop command")
+                while True:
+                    time.sleep(5)
+                    resume_cmd = check_telegram_commands(TG_TOKEN, TG_CHAT)
+                    if resume_cmd in ("/start", "/resume", "/restart"):
+                        notify("Bot resumed!")
+                        logger.info("Bot resumed by Telegram %s command", resume_cmd)
+                        logged_in = False
+                        break
+                continue
+            elif cmd == "/restart":
+                notify("Bot restarting iteration...")
+                logger.info("Bot restarting by Telegram /restart command")
+                logged_in = False
+                continue
+            elif cmd == "/status":
+                notify(f"Bot running. Iteration {iteration}. "
+                       f"Logged in: {logged_in}. Backoff: {backoff}s.")
+                continue
 
         # If we were rate-limited, wait BEFORE making any request
         if backoff > 0:
