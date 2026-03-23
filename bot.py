@@ -291,21 +291,13 @@ def solve_bls_number_captcha(page: Page) -> bool:
     with a 3×3 grid of number images.
 
     BLS uses a custom font that renders different digits than the DOM text,
-    so we must OCR the instruction line visually (not read from DOM).
-
-    Strategy: screenshot the instruction line + each of the 9 grid cells,
-    OCR all 10 images via rucaptcha, use the instruction OCR as target,
-    compare with cell OCR results, click matches.
+    so we cannot trust textContent. Instead we OCR all 9 cells, then
+    determine the target as the most frequent number (the captcha always
+    has multiple correct cells, so the mode = the answer).
     """
     # Find grid layout
     captcha_info = _find_captcha_grid(page)
-    instr_box = captcha_info.get('instrBox')
     cell_boxes = captcha_info.get('cellBoxes', [])
-
-    if not instr_box:
-        logger.error("Cannot find captcha instruction element")
-        take_screenshot(page, "captcha_no_instruction")
-        return False
 
     if len(cell_boxes) < 9:
         logger.error("Could not find captcha grid cells (found %d)", len(cell_boxes))
@@ -314,16 +306,6 @@ def solve_bls_number_captcha(page: Page) -> bool:
 
     os.makedirs("screenshots", exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # Screenshot the instruction line for visual OCR
-    instr_png = page.screenshot(clip={
-        "x": instr_box['x'],
-        "y": instr_box['y'],
-        "width": instr_box['w'],
-        "height": instr_box['h'],
-    })
-    with open(f"screenshots/captcha_instr_{ts}.png", "wb") as f:
-        f.write(instr_png)
 
     # Screenshot each cell
     cell_images_b64 = []
@@ -343,38 +325,41 @@ def solve_bls_number_captcha(page: Page) -> bool:
         with open(f"screenshots/captcha_cell_{ts}_{i+1}.png", "wb") as f:
             f.write(cell_png)
 
-    logger.info("Captured instruction + %d cell screenshots", len(cell_images_b64))
+    logger.info("Captured %d cell screenshots", len(cell_images_b64))
 
-    # OCR instruction + all 9 cells in parallel via rucaptcha
-    instr_b64 = base64.b64encode(instr_png).decode("ascii")
-    all_images = [instr_b64] + cell_images_b64
-    ocr_results = ocr_cells_batch(RUCAPTCHA_KEY, all_images, text_indices={0})
+    # OCR all 9 cells in parallel via rucaptcha
+    ocr_results = ocr_cells_batch(RUCAPTCHA_KEY, cell_images_b64)
     if not ocr_results:
         logger.error("OCR batch failed")
         return False
 
-    # First result is the instruction line OCR — extract the target number
-    instr_ocr = ocr_results[0] or ""
-    cell_ocr = ocr_results[1:]  # remaining 9 are cell results
+    # Clean OCR results: keep only digits
+    cleaned_cells = []
+    for i, ocr_text in enumerate(ocr_results):
+        cleaned = re.sub(r'\D', '', ocr_text) if ocr_text else ""
+        cleaned_cells.append(cleaned)
+        logger.info("Cell %d OCR: '%s' -> '%s'", i + 1, ocr_text, cleaned)
 
-    # Extract target number from instruction OCR (e.g. "Please select all boxes with number 125")
-    instr_digits = re.findall(r'\d+', instr_ocr)
-    if not instr_digits:
-        logger.error("Could not extract target number from instruction OCR: '%s'", instr_ocr)
-        take_screenshot(page, "captcha_instr_ocr_fail")
+    # Determine target: the most frequent number among the 9 cells.
+    # The captcha always has multiple correct cells (3-5), making the
+    # correct number the most common one.
+    from collections import Counter
+    counts = Counter(c for c in cleaned_cells if c)
+    if not counts:
+        logger.error("All OCR results empty: %s", ocr_results)
+        take_screenshot(page, "captcha_ocr_empty")
         return False
 
-    # Take the last number found (the target is at the end of the sentence)
-    target_number = instr_digits[-1]
-    logger.info("Visual OCR instruction: '%s' -> target number: %s", instr_ocr, target_number)
+    target_number = counts.most_common(1)[0][0]
+    target_count = counts.most_common(1)[0][1]
+    logger.info("Target number (most frequent): %s (appears %d times). All counts: %s",
+                target_number, target_count, dict(counts))
 
-    # Find cells whose OCR text matches the target number
+    # Find cells matching target
     cells_to_click = []
-    for i, ocr_text in enumerate(cell_ocr):
-        if ocr_text:
-            cleaned = re.sub(r'\D', '', ocr_text)
-        else:
-            cleaned = ""
+    for i, cleaned in enumerate(cleaned_cells):
+        if cleaned == target_number:
+            cells_to_click.append(i)
         logger.info("Cell %d OCR: '%s' -> cleaned: '%s' (target: %s)",
                     i + 1, ocr_text, cleaned, target_number)
         if cleaned == target_number:
