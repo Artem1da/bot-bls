@@ -137,53 +137,127 @@ def filter_dates(dates: list[str], min_d: date) -> list[str]:
     return result
 
 
+def _find_visible_text_input(page: Page) -> "ElementHandle | None":
+    """Return the first visible, non-hidden text input on the page.
+
+    BLS obfuscates field ids/names on every load, so we can't rely on
+    selectors like #EmailId.  Instead we grab all visible <input type=text>.
+    """
+    for inp in page.query_selector_all("input[type='text']"):
+        try:
+            if inp.is_visible():
+                return inp
+        except Exception:
+            continue
+    return None
+
+
+def _is_login_page(page: Page) -> bool:
+    """Heuristic: are we on the BLS login/verify page?"""
+    url = page.url.lower()
+    content = page.content().lower()
+    return (
+        "login" in url
+        or "session is expired" in content
+        or "please log in" in content
+    )
+
+
 def do_login(page: Page) -> bool:
-    """Log in to BLS account if login form is present."""
-    # Check if we're on a login page or if there's a login link
-    login_link = page.query_selector("a[href*='login'], a[href*='Login'], a:has-text('Login'), a:has-text('Sign In')")
-    if login_link:
-        login_link.click()
-        time.sleep(3)
+    """Log in to BLS account.
 
-    # Check for login form fields
-    email_field = page.query_selector(
-        "#EmailId, #email, input[name='EmailId'], input[name='email'], "
-        "input[type='email'], input[placeholder*='mail']"
-    )
-    password_field = page.query_selector(
-        "#Password, #password, input[name='Password'], input[name='password'], "
-        "input[type='password']"
-    )
+    BLS uses a two-step login:
+      Step 1 — Enter email, click "Verify"
+      Step 2 — Enter password, click "Submit" / "Login"
 
-    if not email_field or not password_field:
-        logger.info("No login form found, may already be logged in")
+    All input fields are type=text with randomised ids, so we locate
+    them positionally (first visible text input on the page).
+    """
+    if not _is_login_page(page):
+        logger.info("Not on login page, assuming already logged in")
         return True
 
-    logger.info("Login form detected, entering credentials...")
+    take_screenshot(page, "login_page")
+
+    # ── Step 1: Email ──
+    logger.info("Login step 1: entering email...")
+    email_field = _find_visible_text_input(page)
+    if not email_field:
+        logger.error("Cannot find email input on login page")
+        take_screenshot(page, "login_no_email_field")
+        return False
+
+    email_field.click()
+    time.sleep(0.3)
     email_field.fill(BLS_EMAIL)
-    time.sleep(0.5)
-    password_field.fill(BLS_PASSWORD)
+    logger.info("Filled email: %s", BLS_EMAIL)
     time.sleep(1)
 
-    # Solve CAPTCHA if present on login page
+    # Solve CAPTCHA if present on email step
     if page.query_selector(".h-captcha, iframe[src*='hcaptcha']"):
-        logger.info("CAPTCHA on login page, solving...")
+        logger.info("CAPTCHA on login page (email step), solving...")
         if not solve_and_submit_captcha(page):
-            logger.error("Failed to solve login CAPTCHA")
+            logger.error("Failed to solve login CAPTCHA (email step)")
             return False
 
-    # Click login button
+    # Click "Verify" button
+    verify_btn = page.query_selector(
+        "button:has-text('Verify'), input[value='Verify'], "
+        "button[type='submit'], input[type='submit']"
+    )
+    if verify_btn:
+        verify_btn.click()
+        logger.info("Clicked Verify button")
+    else:
+        logger.error("Cannot find Verify button")
+        take_screenshot(page, "login_no_verify_btn")
+        return False
+
+    time.sleep(5)
+    take_screenshot(page, "after_verify")
+
+    # Check for rate-limit after verify
+    if is_rate_limited(page):
+        logger.warning("Rate-limited after email verify step")
+        return False
+
+    # ── Step 2: Password ──
+    logger.info("Login step 2: entering password...")
+    password_field = page.query_selector("input[type='password']")
+    if not password_field:
+        # BLS may use type=text for password too
+        password_field = _find_visible_text_input(page)
+
+    if not password_field:
+        logger.error("Cannot find password input after verify")
+        take_screenshot(page, "login_no_password_field")
+        return False
+
+    password_field.click()
+    time.sleep(0.3)
+    password_field.fill(BLS_PASSWORD)
+    logger.info("Filled password")
+    time.sleep(1)
+
+    # Solve CAPTCHA if present on password step
+    if page.query_selector(".h-captcha, iframe[src*='hcaptcha']"):
+        logger.info("CAPTCHA on login page (password step), solving...")
+        if not solve_and_submit_captcha(page):
+            logger.error("Failed to solve login CAPTCHA (password step)")
+            return False
+
+    # Click submit / login button
     for sel in [
-        "input[type='submit']", "button[type='submit']",
+        "button[type='submit']", "input[type='submit']",
         "button:has-text('Login')", "button:has-text('Sign In')",
-        "input[value='Login']", "input[value='Sign In']",
-        "#btnSubmit", "#btnLogin",
+        "button:has-text('Submit')", "input[value='Login']",
+        "input[value='Submit']", "#btnSubmit", "#btnLogin",
     ]:
         try:
             el = page.query_selector(sel)
             if el and el.is_visible():
                 el.click()
-                logger.info("Clicked login button: %s", sel)
+                logger.info("Clicked login/submit button: %s", sel)
                 break
         except Exception:
             continue
@@ -191,9 +265,10 @@ def do_login(page: Page) -> bool:
     time.sleep(5)
     take_screenshot(page, "after_login")
 
-    # Check if login was successful (no longer on login page)
-    if page.query_selector("input[type='password']"):
-        logger.error("Login may have failed — password field still visible")
+    # Verify we left the login page
+    if _is_login_page(page):
+        logger.error("Still on login page after submit — login likely failed")
+        take_screenshot(page, "login_failed")
         return False
 
     logger.info("Login successful")
@@ -557,11 +632,17 @@ def monitor_loop(page: Page, browser: Browser):
 
         except PWTimeout:
             logger.error("Page load timeout")
-            take_screenshot(page, "timeout")
+            try:
+                take_screenshot(page, "timeout")
+            except Exception:
+                pass
             logged_in = False  # Session may have expired
         except Exception as e:
             logger.error("Error in iteration %d: %s", iteration, e, exc_info=True)
-            take_screenshot(page, "error")
+            try:
+                take_screenshot(page, "error")
+            except Exception:
+                pass
             logged_in = False
 
         wait_with_jitter(CHECK_INTERVAL)
