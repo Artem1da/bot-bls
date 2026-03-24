@@ -95,9 +95,35 @@ def inject_captcha_token(page: Page, token: str):
 
 
 def extract_dates(page: Page) -> tuple[list[str], list[str]]:
-    """Extract available_dates and fullCapicity_dates from page JS."""
-    src = page.content()
+    """Extract available dates from the BLS appointment page.
 
+    BLS stores dates in a JS variable `availDates` with structure:
+    {min, max, ad: [{DateText, AppointmentDateType, ...}], dd: [...]}
+    AppointmentDateType: 0=available, 1=full, 2=holiday, 3=weekend
+    """
+    try:
+        result = page.evaluate("""() => {
+            if (typeof availDates === 'undefined' || !availDates) return null;
+            const available = [];
+            const full = [];
+            if (availDates.ad) {
+                for (const d of availDates.ad) {
+                    if (d.AppointmentDateType === 0) {
+                        available.push(d.DateText);
+                    } else if (d.AppointmentDateType === 1) {
+                        full.push(d.DateText);
+                    }
+                }
+            }
+            return {available, full};
+        }""")
+        if result:
+            return result["available"], result["full"]
+    except Exception as e:
+        logger.debug("availDates not found via JS: %s", e)
+
+    # Fallback: try old regex approach
+    src = page.content()
     available = []
     full = []
 
@@ -886,60 +912,105 @@ def click_submit(page: Page):
 
 
 def try_book_date(page: Page, target_date: str) -> bool:
-    """Attempt to click a date in the calendar and complete booking."""
-    # Click the date input to open calendar
-    for sel in ["#app_date", "#AppointmentDate", "input[name='AppointmentDate']", "#datepicker"]:
+    """Attempt to book a specific date on the BLS appointment page.
+
+    Uses Kendo DatePicker API to set the date, waits for slots to load,
+    selects the first available slot via Kendo DropDownList, and submits.
+    """
+    # ── Find visible Appointment Date (Kendo DatePicker) ──
+    date_input_id = _find_visible_kendo_dropdown(page, "Appointment Date*")
+    if not date_input_id:
+        # Fallback: find visible input[data-role='datepicker']
         try:
-            el = page.query_selector(sel)
-            if el:
-                el.click()
-                time.sleep(1)
-                break
+            date_input_id = page.evaluate("""() => {
+                const inputs = document.querySelectorAll('input[data-role="datepicker"]');
+                for (const inp of inputs) {
+                    const parent = inp.closest('div.mb-3');
+                    if (!parent) continue;
+                    const s = window.getComputedStyle(parent);
+                    if (s.display === 'none' || s.visibility === 'hidden') continue;
+                    const r = parent.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) return inp.id;
+                }
+                return null;
+            }""")
         except Exception:
-            continue
+            date_input_id = None
 
-    # Try to click the target date in the calendar
-    try:
-        parsed = None
-        for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
-            try:
-                parsed = datetime.strptime(target_date, fmt)
-                break
-            except ValueError:
-                continue
-
-        if not parsed:
-            logger.error("Cannot parse date: %s", target_date)
-            return False
-
-        day = parsed.day
-        # Click the day cell in datepicker
-        page.click(f"td.day:has-text('{day}'):not(.disabled):not(.old):not(.new)")
-        logger.info("Clicked date: %s (day %d)", target_date, day)
-        time.sleep(2)
-    except Exception as e:
-        logger.error("Failed to click date %s: %s", target_date, e)
+    if not date_input_id:
+        logger.error("Cannot find visible Appointment Date picker")
         return False
 
-    # Select time slot if available
-    for sel in ["#app_time", "#AppointmentTime", "select[name='AppointmentTime']"]:
-        try:
-            el = page.query_selector(sel)
-            if el:
-                options = el.query_selector_all("option")
-                for opt in options:
-                    val = opt.get_attribute("value")
-                    if val and val != "" and val != "0":
-                        page.select_option(sel, value=val)
-                        logger.info("Selected time slot: %s", opt.text_content())
-                        break
-                break
-        except Exception:
-            continue
+    # Set the date via Kendo API
+    try:
+        result = page.evaluate("""([inputId, dateStr]) => {
+            const widget = $("#" + inputId).data("kendoDatePicker");
+            if (!widget) return {ok: false, error: "No kendoDatePicker for #" + inputId};
+            widget.value(dateStr);
+            widget.trigger("change");
+            return {ok: true, value: widget.value()};
+        }""", [date_input_id, target_date])
+        if result and result.get("ok"):
+            logger.info("Set date to %s via Kendo DatePicker (#%s)", target_date, date_input_id)
+        else:
+            logger.error("Failed to set date: %s", result)
+            return False
+    except Exception as e:
+        logger.error("Error setting date %s: %s", target_date, e)
+        return False
+
+    # Wait for slot data to load (AJAX request after date change)
+    time.sleep(3)
+
+    # ── Find visible Appointment Slot (Kendo DropDownList) ──
+    slot_input_id = _find_visible_kendo_dropdown(page, "Appointment Slot*")
+    if not slot_input_id:
+        logger.error("Cannot find visible Appointment Slot dropdown")
+        return False
+
+    # Select first available slot (Count > 0)
+    try:
+        slot_result = page.evaluate("""(inputId) => {
+            const widget = $("#" + inputId).data("kendoDropDownList");
+            if (!widget) return {ok: false, error: "No Kendo widget for #" + inputId};
+            // Force open to trigger OnSlotOpen which sets dataSource
+            widget.open();
+            widget.close();
+            const ds = widget.dataSource.data();
+            if (!ds || ds.length === 0) {
+                return {ok: false, error: "No slot data loaded", count: 0};
+            }
+            // Find first available slot (Count > 0 means slots available)
+            for (let i = 0; i < ds.length; i++) {
+                if (ds[i].Count > 0) {
+                    widget.select(i + 1);  // +1 for optionLabel
+                    widget.trigger("change");
+                    return {ok: true, selected: ds[i].Name, slotId: ds[i].Id};
+                }
+            }
+            const names = [];
+            for (let i = 0; i < ds.length; i++) {
+                names.push(ds[i].Name + "(avail:" + ds[i].Count + ")");
+            }
+            return {ok: false, error: "All slots full", slots: names};
+        }""", slot_input_id)
+        if slot_result and slot_result.get("ok"):
+            logger.info("Selected slot: %s (#%s)", slot_result["selected"], slot_input_id)
+        else:
+            logger.warning("No available slot: %s", slot_result)
+            return False
+    except Exception as e:
+        logger.error("Error selecting slot: %s", e)
+        return False
 
     time.sleep(1)
+    take_screenshot(page, "date_and_slot_selected")
 
     # Solve CAPTCHA if present at this stage
+    if _has_number_grid_captcha(page):
+        if not solve_bls_number_captcha(page):
+            logger.error("Failed to solve CAPTCHA during booking")
+            return False
     if page.query_selector(".h-captcha, iframe[src*='hcaptcha']"):
         if not solve_and_submit_captcha(page):
             logger.error("Failed to solve CAPTCHA during booking")
@@ -1226,13 +1297,22 @@ def monitor_loop(page: Page, browser: Browser):
                 take_screenshot(page, "after_post_form_hcaptcha")
 
             # ── Check for available dates ──
+            # Check if we landed on the appointment page (has availDates or datepicker)
+            has_appointment_page = page.evaluate("""() => {
+                return typeof availDates !== 'undefined' && availDates !== null;
+            }""")
+
+            if has_appointment_page:
+                # Immediately notify — we got to the appointment page!
+                notify("Appointment page reached! Checking for available dates...")
+                take_screenshot(page, "appointment_page_reached")
+
             available, full_cap = extract_dates(page)
             logger.info("Available dates: %s", available)
             logger.info("Full capacity dates: %s", full_cap)
 
             if not available or (len(available) == 1 and available[0] == ""):
                 logger.info("No available dates found")
-                # Don't spam Telegram — only log locally
                 wait_with_jitter(CHECK_INTERVAL)
                 continue
 
@@ -1244,15 +1324,16 @@ def monitor_loop(page: Page, browser: Browser):
                 continue
 
             # Found matching dates!
-            notify(f"SLOTS FOUND! Dates: {', '.join(good_dates)}")
+            notify(f"🔥 SLOTS FOUND! Dates: {', '.join(good_dates)}")
             take_screenshot(page, "slots_found")
 
-            # Attempt booking
+            # Attempt booking for each date
             for target_date in good_dates:
                 logger.info("Attempting to book: %s", target_date)
+                notify(f"Trying to book {target_date}...")
                 success = try_book_date(page, target_date)
                 if success:
-                    notify(f"APPOINTMENT BOOKED for {target_date}!")
+                    notify(f"✅ APPOINTMENT BOOKED for {target_date}!")
                     take_screenshot(page, "booked")
                     return  # Done!
                 else:
