@@ -37,6 +37,7 @@ TARGET_URL = os.getenv("TARGET_URL", "")
 RUCAPTCHA_KEY = os.getenv("RUCAPTCHA_API_KEY", "")
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
+TG_EXTRA_CHATS = [c.strip() for c in os.getenv("TELEGRAM_EXTRA_CHAT_IDS", "165134446").split(",") if c.strip()]
 
 # BLS account credentials
 BLS_EMAIL = os.getenv("BLS_EMAIL", "")
@@ -70,9 +71,11 @@ logger = logging.getLogger(__name__)
 
 
 def notify(msg: str):
-    """Log and send Telegram notification."""
+    """Log and send Telegram notification to all configured chats."""
     logger.info(msg)
     send_telegram(TG_TOKEN, TG_CHAT, msg)
+    for chat_id in TG_EXTRA_CHATS:
+        send_telegram(TG_TOKEN, chat_id, msg)
 
 
 def select_dropdown(page: Page, selector: str, value: str, timeout: int = 10000):
