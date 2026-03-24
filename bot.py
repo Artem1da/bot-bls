@@ -50,7 +50,7 @@ APPOINTMENT_FOR = os.getenv("APPOINTMENT_FOR", "Individual")
 MIN_DATE_STR = os.getenv("MIN_DATE", "2026-04-04")
 MIN_DATE = date.fromisoformat(MIN_DATE_STR)
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
 HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 
 # Rate-limit backoff settings
