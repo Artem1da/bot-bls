@@ -185,10 +185,11 @@ def _is_login_page(page: Page) -> bool:
     url = page.url.lower()
     content = page.content().lower()
     return (
-        "login" in url
+        "/login" in url
         or "session is expired" in content
         or "please log in" in content
         or "enter your account password" in content
+        or "email is required" in content
     )
 
 
@@ -1192,7 +1193,12 @@ def monitor_loop(page: Page, browser: Browser):
             take_screenshot(page, "page_loaded")
             logger.info("Page: %s | URL: %s", page.title(), page.url)
 
-            # Login if needed
+            # Login if needed — also detect session expiry mid-run
+            if logged_in and _is_login_page(page):
+                logger.warning("Session expired — detected login page, re-logging in")
+                notify("Session expired, re-logging in...")
+                logged_in = False
+
             if not logged_in:
                 if BLS_EMAIL and BLS_PASSWORD:
                     logged_in = do_login(page)
@@ -1209,6 +1215,14 @@ def monitor_loop(page: Page, browser: Browser):
                 logger.info("Proceeding without Book Appointment click")
 
             time.sleep(3)
+
+            # Check if we got redirected to login after clicking Book
+            if _is_login_page(page):
+                logger.warning("Redirected to login after Book click — session expired")
+                notify("Session expired during booking, re-logging in...")
+                logged_in = False
+                continue
+
             if is_rate_limited(page):
                 backoff = RATE_LIMIT_COOLDOWN
                 logger.warning("Rate-limited after navigating! Will wait %d s", backoff)
