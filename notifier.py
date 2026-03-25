@@ -31,17 +31,22 @@ def send_telegram(bot_token: str, chat_id: str, message: str) -> bool:
     return False
 
 
-def check_telegram_commands(bot_token: str, chat_id: str) -> "str | None":
+def check_telegram_commands(bot_token: str, chat_id: str,
+                            extra_chat_ids: "list[str] | None" = None) -> "str | None":
     """Poll Telegram for new commands from the user.
 
     Returns the command string (e.g. '/stop', '/restart', '/status')
     if a new command was received, or None.
-    Only processes messages from the configured chat_id.
+    Processes messages from chat_id and any extra_chat_ids.
     """
     global _last_update_id
 
     if not bot_token or not chat_id:
         return None
+
+    allowed_chats = {str(chat_id)}
+    if extra_chat_ids:
+        allowed_chats.update(str(c) for c in extra_chat_ids)
 
     url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
     try:
@@ -66,8 +71,8 @@ def check_telegram_commands(bot_token: str, chat_id: str) -> "str | None":
             msg_chat_id = str(msg.get("chat", {}).get("id", ""))
             text = (msg.get("text") or "").strip().lower()
 
-            if msg_chat_id == str(chat_id) and text.startswith("/"):
-                logger.info("Received Telegram command: %s", text)
+            if msg_chat_id in allowed_chats and text.startswith("/"):
+                logger.info("Received Telegram command: %s from %s", text, msg_chat_id)
                 return text
 
     except Exception as e:

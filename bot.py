@@ -1075,7 +1075,7 @@ def _handle_telegram_cmd(cmd: str):
         logger.info("Bot paused by Telegram /stop command (during wait)")
         while True:
             time.sleep(5)
-            resume = check_telegram_commands(TG_TOKEN, TG_CHAT)
+            resume = check_telegram_commands(TG_TOKEN, TG_CHAT, TG_EXTRA_CHATS)
             if resume in ("/start", "/resume", "/restart"):
                 notify("Bot resumed!")
                 logger.info("Bot resumed by Telegram %s command", resume)
@@ -1104,7 +1104,7 @@ def wait_with_jitter(seconds: float):
         chunk = min(poll_interval, actual - elapsed)
         time.sleep(chunk)
         elapsed += chunk
-        cmd = check_telegram_commands(TG_TOKEN, TG_CHAT)
+        cmd = check_telegram_commands(TG_TOKEN, TG_CHAT, TG_EXTRA_CHATS)
         if cmd:
             _handle_telegram_cmd(cmd)
 
@@ -1154,14 +1154,14 @@ def monitor_loop(page: Page, browser: Browser):
     logged_in = False
     backoff = 0  # current rate-limit backoff in seconds
 
-    RATE_LIMIT_COOLDOWN = 120  # minimum 2 minutes on rate-limit
+    RATE_LIMIT_COOLDOWN = 650  # ~11 minutes on rate-limit
 
     while True:
         iteration += 1
         logger.info("── Iteration %d ──", iteration)
 
         # ── Check for Telegram commands ──
-        cmd = check_telegram_commands(TG_TOKEN, TG_CHAT)
+        cmd = check_telegram_commands(TG_TOKEN, TG_CHAT, TG_EXTRA_CHATS)
         if cmd:
             if cmd == "/status":
                 notify(f"Bot running. Iteration {iteration}. "
