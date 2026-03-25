@@ -1199,7 +1199,6 @@ def monitor_loop(page: Page, browser: Browser):
             # Login if needed — also detect session expiry mid-run
             if logged_in and _is_login_page(page):
                 logger.warning("Session expired — detected login page, re-logging in")
-                notify("Session expired, re-logging in...")
                 logged_in = False
 
             if not logged_in:
@@ -1222,13 +1221,13 @@ def monitor_loop(page: Page, browser: Browser):
             # Check if we got redirected to login after clicking Book
             if _is_login_page(page):
                 logger.warning("Redirected to login after Book click — session expired")
-                notify("Session expired during booking, re-logging in...")
                 logged_in = False
                 continue
 
             if is_rate_limited(page):
                 backoff = RATE_LIMIT_COOLDOWN
                 logger.warning("Rate-limited after navigating! Will wait %d s", backoff)
+                notify(f"[Iter {iteration}] Rate-limited after Book click. Cooling down {backoff}s.")
                 logged_in = False
                 continue
 
