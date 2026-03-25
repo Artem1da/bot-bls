@@ -71,12 +71,14 @@ logger = logging.getLogger(__name__)
 
 
 def notify(msg: str):
-    """Log and send Telegram notification to all configured chats."""
+    """Log and send Telegram notification to all configured chats (deduped)."""
     logger.info(msg)
-    send_telegram(TG_TOKEN, TG_CHAT, msg)
-    for chat_id in TG_EXTRA_CHATS:
-        if str(chat_id) != str(TG_CHAT):
-            send_telegram(TG_TOKEN, chat_id, msg)
+    sent_to = set()
+    for chat_id in [TG_CHAT] + TG_EXTRA_CHATS:
+        cid = str(chat_id).strip()
+        if cid and cid not in sent_to:
+            send_telegram(TG_TOKEN, cid, msg)
+            sent_to.add(cid)
 
 
 def select_dropdown(page: Page, selector: str, value: str, timeout: int = 10000):
