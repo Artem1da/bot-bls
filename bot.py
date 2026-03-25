@@ -83,7 +83,7 @@ def select_dropdown(page: Page, selector: str, value: str, timeout: int = 10000)
     page.wait_for_selector(selector, timeout=timeout)
     page.select_option(selector, label=value)
     logger.info("Selected '%s' in %s", value, selector)
-    time.sleep(1)  # allow dependent dropdowns to load
+    time.sleep(0.5)  # allow dependent dropdowns to load
 
 
 def inject_captcha_token(page: Page, token: str):
@@ -640,7 +640,7 @@ def do_login(page: Page) -> bool:
         take_screenshot(page, "login_no_submit")
         return False
 
-    time.sleep(3)
+    time.sleep(2)
     take_screenshot(page, "after_login")
 
     # Check for rate-limit
@@ -674,7 +674,7 @@ def click_book_appointment(page: Page) -> bool:
             if el and el.is_visible():
                 el.click()
                 logger.info("Clicked 'Book Appointment': %s", sel)
-                time.sleep(3)
+                time.sleep(2)
                 return True
         except Exception:
             continue
@@ -797,7 +797,7 @@ def fill_form(page: Page) -> bool:
     if cat_id:
         if _select_kendo_dropdown(page, cat_id, CATEGORY, "Category"):
             filled_count += 1
-        time.sleep(1)
+        time.sleep(0.5)
     else:
         logger.warning("Could not find visible Category dropdown")
 
@@ -822,7 +822,7 @@ def fill_form(page: Page) -> bool:
         }""", APPOINTMENT_FOR)
         logger.info("Selected Appointment For: %s", APPOINTMENT_FOR)
         filled_count += 1
-        time.sleep(1)
+        time.sleep(0.5)
     except Exception as e:
         logger.warning("Failed to set Appointment For: %s", e)
 
@@ -831,7 +831,7 @@ def fill_form(page: Page) -> bool:
     if loc_id:
         if _select_kendo_dropdown(page, loc_id, LOCATION, "Location"):
             filled_count += 1
-        time.sleep(2)  # dependent dropdowns need time to load
+        time.sleep(1)  # dependent dropdowns need time to load
     else:
         logger.warning("Could not find visible Location dropdown")
 
@@ -840,7 +840,7 @@ def fill_form(page: Page) -> bool:
     if vt_id:
         if _select_kendo_dropdown(page, vt_id, VISA_TYPE, "Visa Type"):
             filled_count += 1
-        time.sleep(2)
+        time.sleep(1)
     else:
         logger.warning("Could not find visible Visa Type dropdown")
 
@@ -849,7 +849,7 @@ def fill_form(page: Page) -> bool:
     if vst_id:
         if _select_kendo_dropdown(page, vst_id, VISA_SUB_TYPE, "Visa Sub Type"):
             filled_count += 1
-        time.sleep(1)
+        time.sleep(0.5)
     else:
         logger.warning("Could not find visible Visa Sub Type dropdown")
 
@@ -964,7 +964,7 @@ def try_book_date(page: Page, target_date: str) -> bool:
         return False
 
     # Wait for slot data to load (AJAX request after date change)
-    time.sleep(3)
+    time.sleep(2)
 
     # ── Find visible Appointment Slot (Kendo DropDownList) ──
     slot_input_id = _find_visible_kendo_dropdown(page, "Appointment Slot*")
@@ -1022,7 +1022,7 @@ def try_book_date(page: Page, target_date: str) -> bool:
 
     # Submit
     click_submit(page)
-    time.sleep(5)
+    time.sleep(3)
 
     take_screenshot(page, "booking_result")
 
@@ -1181,7 +1181,7 @@ def monitor_loop(page: Page, browser: Browser):
         try:
             # Navigate to the appointment page
             page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
-            time.sleep(3)
+            time.sleep(2)
 
             # ── Rate-limit detection ──
             if is_rate_limited(page):
@@ -1199,7 +1199,6 @@ def monitor_loop(page: Page, browser: Browser):
             # Login if needed — also detect session expiry mid-run
             if logged_in and _is_login_page(page):
                 logger.warning("Session expired — detected login page, re-logging in")
-                notify("Session expired, re-logging in...")
                 logged_in = False
 
             if not logged_in:
@@ -1217,12 +1216,11 @@ def monitor_loop(page: Page, browser: Browser):
                 # Maybe we're already on the form page, try to continue
                 logger.info("Proceeding without Book Appointment click")
 
-            time.sleep(3)
+            time.sleep(2)
 
             # Check if we got redirected to login after clicking Book
             if _is_login_page(page):
                 logger.warning("Redirected to login after Book click — session expired")
-                notify("Session expired during booking, re-logging in...")
                 logged_in = False
                 continue
 
@@ -1244,7 +1242,7 @@ def monitor_loop(page: Page, browser: Browser):
                     continue
                 # Click Submit to pass the captcha page
                 click_submit(page)
-                time.sleep(5)
+                time.sleep(3)
                 take_screenshot(page, "after_pre_form_captcha")
 
             if page.query_selector(".h-captcha, iframe[src*='hcaptcha']"):
@@ -1254,7 +1252,7 @@ def monitor_loop(page: Page, browser: Browser):
                     wait_with_jitter(CHECK_INTERVAL)
                     continue
                 click_submit(page)
-                time.sleep(5)
+                time.sleep(3)
                 take_screenshot(page, "after_pre_form_hcaptcha")
 
             # ── Now we should be on the form page with dropdowns ──
@@ -1266,7 +1264,7 @@ def monitor_loop(page: Page, browser: Browser):
 
             # Fill the visa type form (Category, Location, etc.)
             form_ok = fill_form(page)
-            time.sleep(2)
+            time.sleep(1)
 
             take_screenshot(page, "form_filled")
 
@@ -1280,7 +1278,7 @@ def monitor_loop(page: Page, browser: Browser):
 
             # Click submit/book to proceed to the calendar
             click_submit(page)
-            time.sleep(3)
+            time.sleep(2)
 
             take_screenshot(page, "after_form_submit")
 
@@ -1300,7 +1298,7 @@ def monitor_loop(page: Page, browser: Browser):
                     wait_with_jitter(CHECK_INTERVAL)
                     continue
                 click_submit(page)
-                time.sleep(5)
+                time.sleep(3)
                 take_screenshot(page, "after_post_form_captcha")
 
             if page.query_selector(".h-captcha, iframe[src*='hcaptcha']"):
@@ -1310,7 +1308,7 @@ def monitor_loop(page: Page, browser: Browser):
                     wait_with_jitter(CHECK_INTERVAL)
                     continue
                 click_submit(page)
-                time.sleep(5)
+                time.sleep(3)
                 take_screenshot(page, "after_post_form_hcaptcha")
 
             # ── Check for available dates ──
