@@ -1,14 +1,17 @@
-"""CAPTCHA solvers using rucaptcha.com API.
+"""CAPTCHA solvers: local Tesseract OCR (fast) with rucaptcha.com fallback.
 
 Supports:
-  - hCaptcha (token-based)
-  - BLS number-grid CAPTCHA (OCR each cell individually)
+  - BLS number-grid CAPTCHA (local OCR via Tesseract, ~1-2s)
+  - hCaptcha (token-based, via rucaptcha)
+  - Fallback to rucaptcha for OCR if Tesseract fails
 """
 
 import base64
+import io
 import re
 import time
 import logging
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -17,6 +20,103 @@ logger = logging.getLogger(__name__)
 
 RUCAPTCHA_IN = "https://rucaptcha.com/in.php"
 RUCAPTCHA_RES = "https://rucaptcha.com/res.php"
+
+# ── Local OCR with Tesseract ─────────────────────────────────────────
+
+_tesseract_available = False
+try:
+    import pytesseract
+    from PIL import Image, ImageFilter, ImageOps
+    _tesseract_available = True
+    logger.info("Tesseract OCR available for local CAPTCHA solving")
+except ImportError:
+    logger.warning("pytesseract/Pillow not installed, will use rucaptcha for OCR")
+
+
+def _preprocess_variants(img_bytes: bytes) -> "list[Image.Image]":
+    """Generate multiple preprocessed versions of a cell image for OCR.
+
+    BLS CAPTCHA uses various color/background combos, so we try:
+    1. Grayscale with threshold
+    2. Grayscale inverted threshold
+    3. Each RGB channel separately (catches colored text on colored bg)
+    4. Saturation channel from HSV (separates color from brightness)
+    """
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    scale = 3
+    variants = []
+
+    # Helper: scale up and clean with multiple thresholds
+    def _finish(gray_img):
+        big = gray_img.resize((gray_img.width * scale, gray_img.height * scale), Image.LANCZOS)
+        big = ImageOps.autocontrast(big, cutoff=5)
+        results = []
+        for thresh in [100, 128, 160]:
+            normal = big.point(lambda p, t=thresh: 255 if p > t else 0)
+            normal = normal.filter(ImageFilter.MedianFilter(3))
+            results.append(normal)
+
+            inverted = big.point(lambda p, t=thresh: 0 if p > t else 255)
+            inverted = inverted.filter(ImageFilter.MedianFilter(3))
+            results.append(inverted)
+        return results
+
+    # 1. Standard grayscale
+    gray = img.convert("L")
+    variants.extend(_finish(gray))
+
+    # 2. Individual RGB channels
+    for ch_idx in range(3):
+        channel = img.split()[ch_idx]
+        variants.extend(_finish(channel))
+
+    # 3. Saturation channel (HSV) — highlights colored regions
+    try:
+        hsv = img.convert("HSV")
+        s_channel = hsv.split()[1]  # Saturation
+        variants.extend(_finish(s_channel))
+    except Exception:
+        pass
+
+    return variants
+
+
+def ocr_cell_local(img_bytes: bytes) -> str | None:
+    """OCR a single cell image locally using Tesseract.
+
+    Tries multiple preprocessing variants. Returns digits-only string or None.
+    """
+    if not _tesseract_available:
+        return None
+
+    config = "--psm 8 -c tessedit_char_whitelist=0123456789"
+
+    for processed in _preprocess_variants(img_bytes):
+        try:
+            text = pytesseract.image_to_string(processed, config=config).strip()
+            digits = re.sub(r'\D', '', text)
+            if 2 <= len(digits) <= 4:
+                return digits
+        except Exception as e:
+            logger.debug("Tesseract OCR attempt failed: %s", e)
+
+    return None
+
+
+def ocr_cells_local(cell_images_png: list[bytes]) -> list[str | None]:
+    """OCR all cell images locally using Tesseract. Returns list of digit strings."""
+    if not _tesseract_available:
+        return [None] * len(cell_images_png)
+
+    results = []
+    for i, img_bytes in enumerate(cell_images_png):
+        text = ocr_cell_local(img_bytes)
+        results.append(text)
+        logger.debug("Local OCR cell %d: '%s'", i + 1, text)
+
+    success = sum(1 for r in results if r)
+    logger.info("Local OCR: %d/%d cells recognized: %s", success, len(results), results)
+    return results
 
 
 def _poll_result(api_key: str, request_id: str, max_attempts: int = 30,

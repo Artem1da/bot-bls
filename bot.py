@@ -27,7 +27,7 @@ from playwright.sync_api import sync_playwright, Page, Browser, TimeoutError as 
 
 import base64
 
-from captcha_solver import solve_hcaptcha, ocr_cells_batch
+from captcha_solver import solve_hcaptcha, ocr_cells_batch, ocr_cells_local
 from notifier import send_telegram, check_telegram_commands
 
 load_dotenv()
@@ -342,6 +342,7 @@ def solve_bls_number_captcha(page: Page) -> bool:
 
     # Screenshot each cell
     cell_images_b64 = []
+    cell_images_png = []
     for i, box in enumerate(cell_boxes):
         # Inset by 10% to avoid grid borders / gaps between cells
         inset_x = box['w'] * 0.10
@@ -353,6 +354,7 @@ def solve_bls_number_captcha(page: Page) -> bool:
             "height": box['h'] - 2 * inset_y,
         }
         cell_png = page.screenshot(clip=clip)
+        cell_images_png.append(cell_png)
         cell_b64 = base64.b64encode(cell_png).decode("ascii")
         cell_images_b64.append(cell_b64)
         with open(f"screenshots/captcha_cell_{ts}_{i+1}.png", "wb") as f:
@@ -360,11 +362,25 @@ def solve_bls_number_captcha(page: Page) -> bool:
 
     logger.info("Captured %d cell screenshots", len(cell_images_b64))
 
-    # OCR all 9 cells in parallel via rucaptcha
-    ocr_results = ocr_cells_batch(RUCAPTCHA_KEY, cell_images_b64)
-    if not ocr_results:
-        logger.error("OCR batch failed")
-        return False
+    # ── Try local Tesseract OCR first (fast, ~1-2s) ──
+    import time as _time
+    _ocr_start = _time.monotonic()
+    local_results = ocr_cells_local(cell_images_png)
+    _ocr_elapsed = _time.monotonic() - _ocr_start
+    local_success = sum(1 for r in local_results if r)
+    logger.info("Local OCR: %d/9 cells in %.1fs: %s", local_success, _ocr_elapsed, local_results)
+
+    if local_success >= 6:
+        # Local OCR worked — 6/9 is enough for most-frequent approach
+        ocr_results = local_results
+        logger.info("Using local Tesseract OCR results (fast path, %.1fs)", _ocr_elapsed)
+    else:
+        # Fall back to rucaptcha
+        logger.info("Local OCR insufficient (%d/9), falling back to rucaptcha", local_success)
+        ocr_results = ocr_cells_batch(RUCAPTCHA_KEY, cell_images_b64)
+        if not ocr_results:
+            logger.error("OCR batch failed")
+            return False
 
     # Clean OCR results: keep only digits
     cleaned_cells = []
